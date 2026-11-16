@@ -24,9 +24,14 @@ extern "C" void app_main(void) {
     // Allow battery rail and decoupling capacitors to stabilize before RF calibration
     vTaskDelay(pdMS_TO_TICKS(250));
 
-    ESP_LOGI(TAG, "Booting YD-ESP32-S3 3-Servo MP90S Arm Controller...");
+    esp_reset_reason_t rst = esp_reset_reason();
+    if (rst == ESP_RST_BROWNOUT) {
+        ESP_LOGW(TAG, "WARNING: Previous reset was caused by BROWNOUT (battery voltage sagged under load)!");
+    }
 
-    // 1. Flash Storage (NVS) for calibration offsets, programmable actions & BLE calibration
+    ESP_LOGI(TAG, "Booting YD-ESP32-S3 3-Servo MP90S Arm Controller (reset_reason=%d)...", (int)rst);
+
+    // 1. Flash Storage (NVS) for calibration offsets & programmable actions
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -48,4 +53,3 @@ extern "C" void app_main(void) {
 
     ESP_LOGI(TAG, "All subsystems running. Servos idle until commanded.");
 }
-

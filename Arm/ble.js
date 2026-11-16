@@ -1,4 +1,3 @@
-
 const UART_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
 const UART_RX_CHAR_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
 const UART_TX_CHAR_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
@@ -15,8 +14,10 @@ let txCount = 0;
 let rawLogLines = [];
 let cmdQueue = [];
 let isProcessingQueue = false;
+let consecutiveWriteErrors = 0;
 let toastTimeout = null;
 let rxLineBuffer = "";
+let brownoutNotified = false;
 
 function updateCounterDisplay() {
   const el = document.getElementById("ble-counters");
@@ -46,7 +47,14 @@ function showToast(msg, type = "info") {
 
   toast.classList.add("show");
   if (toastTimeout) clearTimeout(toastTimeout);
-  toastTimeout = setTimeout(() => { toast.classList.remove("show"); }, 2400);
+  toastTimeout = setTimeout(() => { toast.classList.remove("show"); }, 2600);
+}
+
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} timeout (${ms}ms)`)), ms))
+  ]);
 }
 
 function getBleBackend() {
@@ -102,10 +110,31 @@ async function connectDevice() {
 
       try { if (Ble.stopLEScan) await Ble.stopLEScan(); } catch (e) {}
 
-      await Ble.connect({ deviceId: nativeDeviceId });
+      await Ble.connect({ deviceId: nativeDeviceId }, () => {
+        if (isConnected) {
+          showToast("ESP32 disconnected (check battery power)", "error");
+          onDisconnectedCleanup();
+        }
+      });
       await new Promise(r => setTimeout(r, 600));
 
       if (Ble.addListener) {
+        try {
+          await Ble.addListener("disconnected", () => {
+            if (isConnected) {
+              showToast("ESP32 disconnected (check battery power)", "error");
+              onDisconnectedCleanup();
+            }
+          });
+        } catch (e) {}
+        try {
+          await Ble.addListener(`disconnected|${nativeDeviceId}`, () => {
+            if (isConnected) {
+              showToast("ESP32 disconnected (check battery power)", "error");
+              onDisconnectedCleanup();
+            }
+          });
+        } catch (e) {}
         try {
           await Ble.addListener("notification", (result) => {
             if (result) {
@@ -143,7 +172,10 @@ async function connectDevice() {
         optionalServices: [UART_SERVICE_UUID]
       });
 
-      webDevice.addEventListener("gattserverdisconnected", onDisconnectedCleanup);
+      webDevice.addEventListener("gattserverdisconnected", () => {
+        if (isConnected) showToast("ESP32 disconnected (check battery power)", "error");
+        onDisconnectedCleanup();
+      });
       webServer = await webDevice.gatt.connect();
 
       const service = await webServer.getPrimaryService(UART_SERVICE_UUID);
@@ -181,7 +213,11 @@ async function disconnectDevice() {
 
 function onConnectedSuccess(name) {
   isConnected = true;
+  consecutiveWriteErrors = 0;
+  cmdQueue = [];
+  isProcessingQueue = false;
   rxLineBuffer = "";
+  brownoutNotified = false;
   document.getElementById("device-name").innerText = name;
   setUiState("Connected", "#10b981", "Disconnect");
   appendLog("BLE", `Connected to ${name}.`);
@@ -199,6 +235,9 @@ function onDisconnectedCleanup() {
   webDevice = null;
   webServer = null;
   webTxChar = null;
+  cmdQueue = [];
+  isProcessingQueue = false;
+  consecutiveWriteErrors = 0;
   rxLineBuffer = "";
   document.getElementById("device-name").innerText = "None Connected";
   setUiState("Disconnected", "#f43f5e", "Connect BLE");
@@ -211,16 +250,45 @@ function onDisconnectedCleanup() {
   }
 }
 
+function getCoalesceKey(cmd) {
+  if (cmd.startsWith("s1 ")) return "s1";
+  if (cmd.startsWith("s2 ")) return "s2";
+  if (cmd.startsWith("s3 ")) return "s3";
+  if (cmd.startsWith("offset s1 ")) return "o1";
+  if (cmd.startsWith("offset s2 ")) return "o2";
+  if (cmd.startsWith("offset s3 ")) return "o3";
+  if (cmd === "status") return "status";
+  return null;
+}
+
 async function sendCommand(commandText) {
+  if (!isConnected) {
+    appendLog("Offline", commandText);
+    return;
+  }
+
+  // Replace stale queued slider/offset commands for the same servo so BLE never backs up
+  const key = getCoalesceKey(commandText);
+  if (key !== null) {
+    for (let i = cmdQueue.length - 1; i >= 0; i--) {
+      if (getCoalesceKey(cmdQueue[i]) === key) {
+        cmdQueue.splice(i, 1);
+      }
+    }
+  }
+
   cmdQueue.push(commandText);
   if (isProcessingQueue) return;
   isProcessingQueue = true;
 
-  while (cmdQueue.length > 0) {
-    const nextCmd = cmdQueue.shift();
-    await executeSendCommand(nextCmd);
+  try {
+    while (cmdQueue.length > 0 && isConnected) {
+      const nextCmd = cmdQueue.shift();
+      await executeSendCommand(nextCmd);
+    }
+  } finally {
+    isProcessingQueue = false;
   }
-  isProcessingQueue = false;
 }
 
 function textToHexBytes(str) {
@@ -242,33 +310,34 @@ async function writeChunk(backend, chunkStr) {
     const hexPayload = textToHexBytes(chunkStr);
     const b64Payload = textToBase64(chunkStr);
     try {
-      await Ble.writeWithoutResponse({
+      await withTimeout(Ble.writeWithoutResponse({
         deviceId: nativeDeviceId,
         service: UART_SERVICE_UUID,
         characteristic: UART_RX_CHAR_UUID,
         value: hexPayload
-      });
+      }), 1500, "BLE writeNoRsp");
     } catch (writeErr) {
-      await Ble.write({
+      if (!isConnected) throw writeErr;
+      await withTimeout(Ble.write({
         deviceId: nativeDeviceId,
         service: UART_SERVICE_UUID,
         characteristic: UART_RX_CHAR_UUID,
         value: b64Payload
-      });
+      }), 2000, "BLE write");
     }
   } else if (webTxChar) {
     const encoder = new TextEncoder();
     const bytes = encoder.encode(chunkStr);
-    if (webTxChar.writeValueWithoutResponse) await webTxChar.writeValueWithoutResponse(bytes);
-    else await webTxChar.writeValue(bytes);
+    if (webTxChar.writeValueWithoutResponse) {
+      await withTimeout(webTxChar.writeValueWithoutResponse(bytes), 1500, "WebBLE writeNoRsp");
+    } else {
+      await withTimeout(webTxChar.writeValue(bytes), 2000, "WebBLE write");
+    }
   }
 }
 
 async function executeSendCommand(commandText) {
-  if (!isConnected) {
-    appendLog("Offline", commandText);
-    return;
-  }
+  if (!isConnected) return;
 
   const backend = getBleBackend();
   const payload = commandText.endsWith("\n") ? commandText : (commandText + "\n");
@@ -283,13 +352,22 @@ async function executeSendCommand(commandText) {
       }
     }
 
+    consecutiveWriteErrors = 0;
     txCount++;
     updateCounterDisplay();
     if (!commandText.startsWith("s1 ") && !commandText.startsWith("s2 ") && !commandText.startsWith("s3 ") && commandText !== "status") {
       appendLog("TX", commandText);
     }
   } catch (err) {
-    appendLog("Send Error", err.message || err);
+    consecutiveWriteErrors++;
+    const errMsg = err?.message || String(err);
+    appendLog("Send Error", errMsg);
+
+    const lower = errMsg.toLowerCase();
+    if (lower.includes("not connected") || lower.includes("disconnected") || consecutiveWriteErrors >= 2) {
+      showToast("BLE link lost (possible battery sag) — reconnect", "error");
+      onDisconnectedCleanup();
+    }
   }
 }
 
@@ -431,6 +509,13 @@ function handleIncomingBleData(rawText, sourceTag = "BLE") {
       const mRun = text.match(/run=(\d+)/);
       const mAct = text.match(/act=(\d+)/);
       const mLoop = text.match(/loop=(\d+)/);
+      const mBo = text.match(/bo=(\d+)/);
+
+      if (mBo && mBo[1] === "1" && !brownoutNotified) {
+        brownoutNotified = true;
+        appendLog("Warn", "ESP32 previously rebooted due to BROWNOUT (battery voltage sag).");
+        showToast("Warning: Battery sag caused brownout reset!", "warn");
+      }
 
       if (ms1 && ms2 && ms3 && typeof applyReceivedAngles === "function") {
         applyReceivedAngles(parseInt(ms1[1], 10), parseInt(ms2[1], 10), parseInt(ms3[1], 10));
@@ -522,4 +607,3 @@ function exportTerminalLogs() {
   document.body.removeChild(a);
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
-

@@ -1,5 +1,3 @@
-
-
 #include "command_processor.h"
 #include "servo_controller.h"
 #include "ble_server.h"
@@ -35,16 +33,18 @@ void command_notify_status(void) {
     servo_get_all_angles(&s1, &s2, &s3);
     servo_get_all_offsets(&o1, &o2, &o3);
     servo_get_all_enabled(&e1, &e2, &e3);
+    int brownout = (esp_reset_reason() == ESP_RST_BROWNOUT) ? 1 : 0;
 
-    char status_str[192];
+    char status_str[200];
     snprintf(status_str, sizeof(status_str),
-             "STATUS:s1=%d,s2=%d,s3=%d,o1=%d,o2=%d,o3=%d,en1=%d,en2=%d,en3=%d,idle=%d,run=%d,act=%d,loop=%d\n",
+             "STATUS:s1=%d,s2=%d,s3=%d,o1=%d,o2=%d,o3=%d,en1=%d,en2=%d,en3=%d,idle=%d,run=%d,act=%d,loop=%d,bo=%d\n",
              s1, s2, s3, o1, o2, o3,
              e1 ? 1 : 0, e2 ? 1 : 0, e3 ? 1 : 0,
              servo_get_auto_idle() ? 1 : 0,
              servo_is_sequence_running() ? 1 : 0,
              servo_get_active_slot(),
-             servo_is_sequence_looping() ? 1 : 0);
+             servo_is_sequence_looping() ? 1 : 0,
+             brownout);
     ble_server_send_notify(status_str);
 }
 
@@ -70,12 +70,11 @@ void command_process(const char *cmd_line, command_print_fn_t print_fn) {
         }
     }
 
-    // Set all 3 servos immediately: "set <s1> <s2> <s3>"
+    // Set all 3 servos smoothly: "set <s1> <s2> <s3>"
     if (strncmp(p, "set ", 4) == 0) {
         int s1 = 90, s2 = 90, s3 = 90;
         if (sscanf(p + 4, "%d %d %d", &s1, &s2, &s3) == 3) {
             servo_set_all(s1, s2, s3);
-            servo_get_all_angles(&s1, &s2, &s3);
             char msg[80];
             snprintf(msg, sizeof(msg), "ANG:%d,%d,%d\n", s1, s2, s3);
             print_fn(msg);
@@ -309,15 +308,17 @@ void command_process(const char *cmd_line, command_print_fn_t print_fn) {
         servo_get_all_angles(&s1, &s2, &s3);
         servo_get_all_offsets(&o1, &o2, &o3);
         servo_get_all_enabled(&e1, &e2, &e3);
-        char msg[192];
+        int brownout = (esp_reset_reason() == ESP_RST_BROWNOUT) ? 1 : 0;
+        char msg[200];
         snprintf(msg, sizeof(msg),
-                 "STATUS:s1=%d,s2=%d,s3=%d,o1=%d,o2=%d,o3=%d,en1=%d,en2=%d,en3=%d,idle=%d,run=%d,act=%d,loop=%d\n",
+                 "STATUS:s1=%d,s2=%d,s3=%d,o1=%d,o2=%d,o3=%d,en1=%d,en2=%d,en3=%d,idle=%d,run=%d,act=%d,loop=%d,bo=%d\n",
                  s1, s2, s3, o1, o2, o3,
                  e1 ? 1 : 0, e2 ? 1 : 0, e3 ? 1 : 0,
                  servo_get_auto_idle() ? 1 : 0,
                  servo_is_sequence_running() ? 1 : 0,
                  servo_get_active_slot(),
-                 servo_is_sequence_looping() ? 1 : 0);
+                 servo_is_sequence_looping() ? 1 : 0,
+                 brownout);
         print_fn(msg);
         return;
     }
@@ -325,13 +326,13 @@ void command_process(const char *cmd_line, command_print_fn_t print_fn) {
     if (strcmp(p, "help") == 0 || strcmp(p, "?") == 0) {
         print_fn("3-Servo MP90S Arm Commands (GPIO 1, 38, 39):\n"
                  "  s1 <0-180> / s2 <0-180> / s3 <0-180> : Move & enable individual servo\n"
-                 "  set <s1> <s2> <s3>                   : Move all 3 immediately\n"
+                 "  set <s1> <s2> <s3>                   : Smooth move all 3\n"
                  "  move <s1> <s2> <s3> [ms]             : Smooth move all 3\n"
                  "  nudge <s1|s2|s3> <+/-deg>            : Fine-step nudge\n"
                  "  home                                 : Center all to 90 deg\n"
                  "  stop                                 : Stop sequence motion\n"
                  "  detach / attach                      : Cut or restore PWM output\n"
-                 "  autoidle <on|off>                    : Auto-detach 650ms after move\n"
+                 "  autoidle <on|off>                    : Auto-detach 1.2s after move\n"
                  "  offset <s1|s2|s3> <-45..45>          : Live trim offset\n"
                  "  cal_set <o1> <o2> <o3>               : Save trim to NVS Flash\n"
                  "  cal_get                              : Read trim offsets\n"
@@ -359,4 +360,3 @@ void command_on_ble_received(const char *cmd, void (*reply_fn)(const char *reply
     ESP_LOGI(TAG, "BLE Command: '%s'", cmd);
     command_process(cmd, reply_fn);
 }
-

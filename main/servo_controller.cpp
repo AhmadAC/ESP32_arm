@@ -1,5 +1,3 @@
-
-
 #include "servo_controller.h"
 #include "ble_server.h"
 #include "driver/ledc.h"
@@ -21,7 +19,8 @@ static const char *TAG = "SERVO_ARM";
 #define LEDC_DUTY_RES       LEDC_TIMER_14_BIT
 #define LEDC_FREQUENCY      50
 #define MOTION_TICK_MS      20
-#define AUTO_IDLE_DELAY_MS  650
+#define SERVO_MAX_STEP_DEG  4.0f   // Max 4 deg per 20ms tick (200 deg/sec) to prevent battery current spikes
+#define AUTO_IDLE_DELAY_MS  1200   // Relax PWM 1.2s after motion finishes when Auto-Idle is ON
 
 static const gpio_num_t SERVO_PINS[SERVO_COUNT] = {
     SERVO_1_PIN,
@@ -62,10 +61,16 @@ static float s_current_f[SERVO_COUNT] = {
     (float)SERVO_DEFAULT_ANGLE,
     (float)SERVO_DEFAULT_ANGLE
 };
+static float s_target_f[SERVO_COUNT] = {
+    (float)SERVO_DEFAULT_ANGLE,
+    (float)SERVO_DEFAULT_ANGLE,
+    (float)SERVO_DEFAULT_ANGLE
+};
 static int  s_offsets[SERVO_COUNT]       = { 0, 0, 0 };
 // Start ALL servos detached (duty = 0) at boot so they never move by themselves on battery
 static bool s_servo_enabled[SERVO_COUNT] = { false, false, false };
-static bool s_auto_idle                  = false;
+// Default Auto-Idle ON to protect battery & BLE from continuous holding torque
+static bool s_auto_idle                  = true;
 static TickType_t s_last_activity_tick   = 0;
 
 static char s_actions[ACTION_NUM_SLOTS][ACTION_MAX_LEN];
@@ -110,7 +115,6 @@ static uint32_t angle_to_duty(float logical_angle, int offset) {
 
 static void apply_hardware_pwm(int idx) {
     if (idx < 0 || idx >= SERVO_COUNT) return;
-    // Duty=0 cleanly completes the current 20ms PWM frame and holds the pin LOW (zero jerk)
     uint32_t duty = s_servo_enabled[idx] ? angle_to_duty(s_current_f[idx], s_offsets[idx]) : 0;
     ledc_set_duty(LEDC_MODE, SERVO_CHANNELS[idx], duty);
     ledc_update_duty(LEDC_MODE, SERVO_CHANNELS[idx]);
@@ -228,6 +232,9 @@ static void servo_motion_task(void *pvParameters) {
                 s_seq_loop = false;
                 s_seq_stop_req = false;
                 s_active_slot = 0;
+                for (int i = 0; i < SERVO_COUNT; i++) {
+                    s_target_f[i] = s_current_f[i];
+                }
                 s_last_activity_tick = xTaskGetTickCount();
                 emit_done = true;
             } else {
@@ -239,6 +246,7 @@ static void servo_motion_task(void *pvParameters) {
                     if (st->move_ms <= 0 || s_phase_elapsed_ms >= st->move_ms) {
                         for (int i = 0; i < SERVO_COUNT; i++) {
                             s_current_f[i] = (float)targets[i];
+                            s_target_f[i] = (float)targets[i];
                         }
                         apply_all_hardware_pwm();
                         s_seq_phase = PHASE_WAIT;
@@ -248,6 +256,7 @@ static void servo_motion_task(void *pvParameters) {
                         float ease = (st->move_ms >= 100) ? (0.5f * (1.0f - cosf((float)M_PI * t))) : t;
                         for (int i = 0; i < SERVO_COUNT; i++) {
                             s_current_f[i] = s_step_start_f[i] + (((float)targets[i] - s_step_start_f[i]) * ease);
+                            s_target_f[i] = s_current_f[i];
                         }
                         apply_all_hardware_pwm();
                     }
@@ -290,14 +299,35 @@ static void servo_motion_task(void *pvParameters) {
             for (int i = 0; i < SERVO_COUNT; i++) {
                 out_a[i] = (int)lroundf(s_current_f[i]);
             }
-        } else if (s_auto_idle) {
-            bool any_enabled = (s_servo_enabled[0] || s_servo_enabled[1] || s_servo_enabled[2]);
-            if (any_enabled && (xTaskGetTickCount() - s_last_activity_tick) >= pdMS_TO_TICKS(AUTO_IDLE_DELAY_MS)) {
-                for (int i = 0; i < SERVO_COUNT; i++) {
-                    s_servo_enabled[i] = false;
+        } else {
+            // Soft-slew manual slider targets so sudden jumps never cause battery current spikes
+            bool any_slewing = false;
+            for (int i = 0; i < SERVO_COUNT; i++) {
+                if (s_servo_enabled[i]) {
+                    float diff = s_target_f[i] - s_current_f[i];
+                    if (fabsf(diff) > 0.05f) {
+                        any_slewing = true;
+                        if (fabsf(diff) <= SERVO_MAX_STEP_DEG) {
+                            s_current_f[i] = s_target_f[i];
+                        } else {
+                            s_current_f[i] += (diff > 0.0f ? SERVO_MAX_STEP_DEG : -SERVO_MAX_STEP_DEG);
+                        }
+                        apply_hardware_pwm(i);
+                    }
                 }
-                apply_all_hardware_pwm();
-                emit_idle_en = true;
+            }
+
+            if (any_slewing) {
+                s_last_activity_tick = xTaskGetTickCount();
+            } else if (s_auto_idle) {
+                bool any_enabled = (s_servo_enabled[0] || s_servo_enabled[1] || s_servo_enabled[2]);
+                if (any_enabled && (xTaskGetTickCount() - s_last_activity_tick) >= pdMS_TO_TICKS(AUTO_IDLE_DELAY_MS)) {
+                    for (int i = 0; i < SERVO_COUNT; i++) {
+                        s_servo_enabled[i] = false;
+                    }
+                    apply_all_hardware_pwm();
+                    emit_idle_en = true;
+                }
             }
         }
 
@@ -344,8 +374,8 @@ void servo_controller_init(void) {
 
     xTaskCreatePinnedToCore(servo_motion_task, "servo_motion_task", 4096, NULL, 5, NULL, 1);
 
-    ESP_LOGI(TAG, "3-Servo MP90S Controller ready (DETACHED at boot) -> S1:GPIO%d, S2:GPIO%d, S3:GPIO%d (Offsets: %d,%d,%d)",
-             SERVO_1_PIN, SERVO_2_PIN, SERVO_3_PIN, s_offsets[0], s_offsets[1], s_offsets[2]);
+    ESP_LOGI(TAG, "3-Servo MP90S Controller ready (DETACHED at boot, auto_idle=%d) -> S1:GPIO%d, S2:GPIO%d, S3:GPIO%d",
+             s_auto_idle ? 1 : 0, SERVO_1_PIN, SERVO_2_PIN, SERVO_3_PIN);
 }
 
 void servo_set_angle(int idx, int angle) {
@@ -367,9 +397,14 @@ void servo_set_angle(int idx, int angle) {
         s_servo_enabled[idx] = true;
         newly_enabled = true;
     }
-    s_current_f[idx] = (float)angle;
+
+    s_target_f[idx] = (float)angle;
+    float diff = s_target_f[idx] - s_current_f[idx];
+    if (fabsf(diff) <= SERVO_MAX_STEP_DEG) {
+        s_current_f[idx] = s_target_f[idx];
+        apply_hardware_pwm(idx);
+    }
     s_last_activity_tick = xTaskGetTickCount();
-    apply_hardware_pwm(idx);
     bool e1 = s_servo_enabled[0], e2 = s_servo_enabled[1], e3 = s_servo_enabled[2];
     xSemaphoreGive(s_mutex);
 
@@ -382,33 +417,7 @@ void servo_set_angle(int idx, int angle) {
 }
 
 void servo_set_all(int s1, int s2, int s3) {
-    s1 = clamp_int(s1, SERVO_MIN_ANGLE, SERVO_MAX_ANGLE);
-    s2 = clamp_int(s2, SERVO_MIN_ANGLE, SERVO_MAX_ANGLE);
-    s3 = clamp_int(s3, SERVO_MIN_ANGLE, SERVO_MAX_ANGLE);
-
-    bool was_running = false;
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-    if (s_seq_running) {
-        s_seq_running = false;
-        s_seq_loop = false;
-        s_seq_stop_req = false;
-        s_active_slot = 0;
-        was_running = true;
-    }
-    s_servo_enabled[0] = true;
-    s_servo_enabled[1] = true;
-    s_servo_enabled[2] = true;
-    s_current_f[0] = (float)s1;
-    s_current_f[1] = (float)s2;
-    s_current_f[2] = (float)s3;
-    s_last_activity_tick = xTaskGetTickCount();
-    apply_all_hardware_pwm();
-    xSemaphoreGive(s_mutex);
-
-    if (was_running) {
-        notify_action_state(false, 0, false);
-    }
-    notify_enable_now(true, true, true);
+    servo_move_smooth(s1, s2, s3, 350);
 }
 
 void servo_move_smooth(int s1, int s2, int s3, int duration_ms) {
@@ -418,9 +427,7 @@ void servo_move_smooth(int s1, int s2, int s3, int duration_ms) {
     duration_ms = clamp_int(duration_ms, 0, 10000);
 
     if (duration_ms == 0) {
-        servo_set_all(s1, s2, s3);
-        notify_angles_now(s1, s2, s3);
-        return;
+        duration_ms = 250; // Soft ramp even when 0ms requested to prevent brownout
     }
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
@@ -454,7 +461,7 @@ void servo_move_smooth(int s1, int s2, int s3, int duration_ms) {
 int servo_get_angle(int idx) {
     if (idx < 0 || idx >= SERVO_COUNT) return 0;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    int a = (int)lroundf(s_current_f[idx]);
+    int a = (int)lroundf(s_target_f[idx]);
     xSemaphoreGive(s_mutex);
     return a;
 }
@@ -486,6 +493,7 @@ void servo_detach_all(void) {
     s_active_slot = 0;
     for (int i = 0; i < SERVO_COUNT; i++) {
         s_servo_enabled[i] = false;
+        s_target_f[i] = s_current_f[i];
     }
     apply_all_hardware_pwm();
     xSemaphoreGive(s_mutex);
@@ -723,6 +731,9 @@ void servo_stop_motion(void) {
     s_seq_loop = false;
     s_seq_stop_req = false;
     s_active_slot = 0;
+    for (int i = 0; i < SERVO_COUNT; i++) {
+        s_target_f[i] = s_current_f[i];
+    }
     s_last_activity_tick = xTaskGetTickCount();
     a1 = (int)lroundf(s_current_f[0]);
     a2 = (int)lroundf(s_current_f[1]);
@@ -753,4 +764,3 @@ bool servo_is_sequence_looping(void) {
     xSemaphoreGive(s_mutex);
     return l;
 }
-

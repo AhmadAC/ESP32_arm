@@ -1,9 +1,7 @@
-
-
 let servoAngles = [90, 90, 90];
 let servoOffsets = [0, 0, 0];
 let servoEnabled = [false, false, false];
-let autoIdleEnabled = false;
+let autoIdleEnabled = true;
 let servoNames = ["Servo 1 — Base", "Servo 2 — Shoulder", "Servo 3 — Gripper"];
 let isOffsetMode = false;
 
@@ -28,6 +26,7 @@ function initServoStorage() {
       if (Array.isArray(parsed) && parsed.length === 3) servoAngles = parsed;
     }
   } catch (e) {}
+  applyAutoIdleState(autoIdleEnabled);
   updateAllServoUI();
 }
 
@@ -179,7 +178,7 @@ function onServoSlider(idx, val) {
         sendCommand(pendingServoCmds[k]);
       }
       pendingServoCmds = {};
-    }, 40);
+    }, 65);
   }
 }
 
@@ -319,4 +318,3 @@ function applyReceivedEnableStates(e1, e2, e3) {
   servoEnabled = [!!e1, !!e2, !!e3];
   updateServoStateBadges();
 }
-
