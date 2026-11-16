@@ -1,11 +1,10 @@
-
-
 #include "ble_server.h"
 #include "servo_controller.h"
 #include "command_processor.h"
 #include <string.h>
 #include <stdio.h>
 #include "esp_log.h"
+#include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -145,9 +144,23 @@ static int gatt_svr_chr_access_tx(uint16_t conn_handle, uint16_t attr_handle,
 
     if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
         int s1 = 90, s2 = 90, s3 = 90;
+        int o1 = 0, o2 = 0, o3 = 0;
+        bool e1 = false, e2 = false, e3 = false;
         servo_get_all_angles(&s1, &s2, &s3);
-        char buf[64];
-        snprintf(buf, sizeof(buf), "ANG:%d,%d,%d\n", s1, s2, s3);
+        servo_get_all_offsets(&o1, &o2, &o3);
+        servo_get_all_enabled(&e1, &e2, &e3);
+        int brownout = (esp_reset_reason() == ESP_RST_BROWNOUT) ? 1 : 0;
+
+        char buf[200];
+        snprintf(buf, sizeof(buf),
+                 "STATUS:s1=%d,s2=%d,s3=%d,o1=%d,o2=%d,o3=%d,en1=%d,en2=%d,en3=%d,idle=%d,run=%d,act=%d,loop=%d,bo=%d\n",
+                 s1, s2, s3, o1, o2, o3,
+                 e1 ? 1 : 0, e2 ? 1 : 0, e3 ? 1 : 0,
+                 servo_get_auto_idle() ? 1 : 0,
+                 servo_is_sequence_running() ? 1 : 0,
+                 servo_get_active_slot(),
+                 servo_is_sequence_looping() ? 1 : 0,
+                 brownout);
         int rc = os_mbuf_append(ctxt->om, buf, strlen(buf));
         return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
     }
@@ -402,4 +415,3 @@ void ble_server_send_notify(const char *message) {
         }
     }
 }
-

@@ -1,10 +1,12 @@
 let servoAngles = [90, 90, 90];
 let servoOffsets = [0, 0, 0];
 let servoEnabled = [false, false, false];
-let autoIdleEnabled = true;
+let autoIdleEnabled = false;
 let servoNames = ["Servo 1 — Base", "Servo 2 — Shoulder", "Servo 3 — Gripper"];
 let isOffsetMode = false;
 
+let isDraggingSlider = [false, false, false];
+let lastSliderEditMs = [0, 0, 0];
 let pendingServoCmds = {};
 let servoThrottleTimer = null;
 
@@ -19,11 +21,6 @@ function initServoStorage() {
     if (storedOffsets) {
       const parsed = JSON.parse(storedOffsets);
       if (Array.isArray(parsed) && parsed.length === 3) servoOffsets = parsed;
-    }
-    const storedAngles = localStorage.getItem("arm_servo_angles");
-    if (storedAngles) {
-      const parsed = JSON.parse(storedAngles);
-      if (Array.isArray(parsed) && parsed.length === 3) servoAngles = parsed;
     }
   } catch (e) {}
   applyAutoIdleState(autoIdleEnabled);
@@ -128,7 +125,7 @@ function toggleAutoIdle() {
   autoIdleEnabled = !autoIdleEnabled;
   applyAutoIdleState(autoIdleEnabled);
   sendCommand(`autoidle ${autoIdleEnabled ? "on" : "off"}`);
-  showToast(autoIdleEnabled ? "Auto-Idle ON (saves battery)" : "Auto-Idle OFF (holds torque)", "info");
+  showToast(autoIdleEnabled ? "Auto-Idle ON (relaxes after 3s)" : "Auto-Idle OFF (holds torque)", "info");
 }
 
 function applyAutoIdleState(enabled) {
@@ -148,10 +145,17 @@ function applyAutoIdleState(enabled) {
   }
 }
 
+function onSliderStart(idx) {
+  isDraggingSlider[idx] = true;
+  lastSliderEditMs[idx] = Date.now();
+}
+
 function onServoSlider(idx, val) {
   const parsed = parseInt(val, 10);
+  if (isNaN(parsed)) return;
   const n = idx + 1;
 
+  lastSliderEditMs[idx] = Date.now();
   servoEnabled[idx] = true;
   updateServoStateBadges();
 
@@ -168,17 +172,36 @@ function onServoSlider(idx, val) {
     const valEl = document.getElementById(`s${n}-val`);
     if (valEl) valEl.innerText = `${parsed}°`;
     pendingServoCmds[`s${n}`] = `s${n} ${parsed}`;
-    try { localStorage.setItem("arm_servo_angles", JSON.stringify(servoAngles)); } catch (e) {}
   }
 
   if (!servoThrottleTimer) {
     servoThrottleTimer = setTimeout(() => {
       servoThrottleTimer = null;
-      for (const k in pendingServoCmds) {
-        sendCommand(pendingServoCmds[k]);
-      }
+      const cmds = pendingServoCmds;
       pendingServoCmds = {};
-    }, 65);
+      for (const k in cmds) {
+        sendCommand(cmds[k]);
+      }
+    }, 80);
+  }
+}
+
+function onSliderCommit(idx, val) {
+  isDraggingSlider[idx] = false;
+  lastSliderEditMs[idx] = Date.now();
+  const parsed = parseInt(val, 10);
+  if (isNaN(parsed)) return;
+  const n = idx + 1;
+
+  if (isOffsetMode) {
+    delete pendingServoCmds[`o${n}`];
+    servoOffsets[idx] = parsed;
+    sendCommand(`offset s${n} ${parsed}`);
+    try { localStorage.setItem("arm_servo_offsets", JSON.stringify(servoOffsets)); } catch (e) {}
+  } else {
+    delete pendingServoCmds[`s${n}`];
+    servoAngles[idx] = parsed;
+    sendCommand(`s${n} ${parsed}`);
   }
 }
 
@@ -195,6 +218,7 @@ function servoStepAction(idx, normalDelta, trimDelta) {
 }
 
 function nudgeServo(idx, delta) {
+  lastSliderEditMs[idx] = Date.now();
   let next = (servoAngles[idx] || 90) + delta;
   if (next < 0) next = 0;
   if (next > 180) next = 180;
@@ -210,10 +234,10 @@ function nudgeServo(idx, delta) {
     if (valEl) valEl.innerText = `${next}°`;
   }
   sendCommand(`s${n} ${next}`);
-  try { localStorage.setItem("arm_servo_angles", JSON.stringify(servoAngles)); } catch (e) {}
 }
 
 function adjustOffset(idx, delta) {
+  lastSliderEditMs[idx] = Date.now();
   let next = (servoOffsets[idx] || 0) + delta;
   if (next < -45) next = -45;
   if (next > 45) next = 45;
@@ -263,7 +287,6 @@ async function saveCalibrationOffsets() {
 function homeAllServos() {
   servoAngles = [90, 90, 90];
   servoEnabled = [true, true, true];
-  try { localStorage.setItem("arm_servo_angles", JSON.stringify(servoAngles)); } catch (e) {}
   if (isOffsetMode) toggleOffsetMode();
   else updateAllServoUI();
   sendCommand("home");
@@ -287,13 +310,17 @@ function requestStatusSync() {
   showToast("Syncing arm state...", "info");
 }
 
-function applyReceivedAngles(s1, s2, s3) {
+function applyReceivedAngles(s1, s2, s3, forceSync = false) {
   const incoming = [s1, s2, s3];
+  const now = Date.now();
   for (let i = 0; i < 3; i++) {
     if (isNaN(incoming[i])) continue;
+    if (!forceSync && (isDraggingSlider[i] || (now - lastSliderEditMs[i]) < 600)) {
+      continue;
+    }
     servoAngles[i] = incoming[i];
     const n = i + 1;
-    if (!isOffsetMode && document.activeElement !== document.getElementById(`s${n}-slider`)) {
+    if (!isOffsetMode) {
       const sl = document.getElementById(`s${n}-slider`);
       if (sl) sl.value = incoming[i];
       const lbl = document.getElementById(`s${n}-val`);

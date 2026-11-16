@@ -8,6 +8,7 @@ let nativeDeviceId = null;
 let webDevice = null;
 let webServer = null;
 let webTxChar = null;
+let webNotifyChar = null;
 
 let rxCount = 0;
 let txCount = 0;
@@ -18,6 +19,8 @@ let consecutiveWriteErrors = 0;
 let toastTimeout = null;
 let rxLineBuffer = "";
 let brownoutNotified = false;
+let activeBleListeners = [];
+let activeNotifChannel = null;
 
 function updateCounterDisplay() {
   const el = document.getElementById("ble-counters");
@@ -81,6 +84,16 @@ function initBackendUI() {
   }
 }
 
+async function clearBleListeners() {
+  const handles = activeBleListeners;
+  activeBleListeners = [];
+  for (const h of handles) {
+    try {
+      if (h && typeof h.remove === "function") await h.remove();
+    } catch (e) {}
+  }
+}
+
 async function toggleConnection() {
   if (isConnected) await disconnectDevice();
   else await connectDevice();
@@ -96,6 +109,8 @@ async function connectDevice() {
 
   setUiState("Connecting...", "#f59e0b", "Connecting");
   appendLog("BLE", "Opening BLE device picker...");
+  await clearBleListeners();
+  activeNotifChannel = null;
 
   try {
     if (backend.type === "capacitor") {
@@ -118,30 +133,47 @@ async function connectDevice() {
       });
       await new Promise(r => setTimeout(r, 600));
 
+      const handleCapacitorNotif = (channelTag, result) => {
+        if (!result) return;
+        if (activeNotifChannel === null) activeNotifChannel = channelTag;
+        else if (activeNotifChannel !== channelTag) return;
+        const decoded = universalBleDecode(result.value !== undefined ? result.value : result);
+        if (decoded) handleIncomingBleData(decoded, "NOTIF");
+      };
+
       if (Ble.addListener) {
+        const scopedKeyLower = `notification|${nativeDeviceId}|${UART_SERVICE_UUID}|${UART_TX_CHAR_UUID}`;
+        const scopedKeyUpper = `notification|${nativeDeviceId}|${UART_SERVICE_UUID.toUpperCase()}|${UART_TX_CHAR_UUID.toUpperCase()}`;
+
         try {
-          await Ble.addListener("disconnected", () => {
+          const hDisc = await Ble.addListener(`disconnected|${nativeDeviceId}`, () => {
             if (isConnected) {
               showToast("ESP32 disconnected (check battery power)", "error");
               onDisconnectedCleanup();
             }
           });
+          if (hDisc) activeBleListeners.push(hDisc);
         } catch (e) {}
+
         try {
-          await Ble.addListener(`disconnected|${nativeDeviceId}`, () => {
-            if (isConnected) {
-              showToast("ESP32 disconnected (check battery power)", "error");
-              onDisconnectedCleanup();
-            }
+          const hLower = await Ble.addListener(scopedKeyLower, (result) => {
+            handleCapacitorNotif("scopedLower", result);
           });
+          if (hLower) activeBleListeners.push(hLower);
         } catch (e) {}
+
         try {
-          await Ble.addListener("notification", (result) => {
-            if (result) {
-              const decoded = universalBleDecode(result.value !== undefined ? result.value : result);
-              if (decoded) handleIncomingBleData(decoded, "NOTIF");
-            }
+          const hUpper = await Ble.addListener(scopedKeyUpper, (result) => {
+            handleCapacitorNotif("scopedUpper", result);
           });
+          if (hUpper) activeBleListeners.push(hUpper);
+        } catch (e) {}
+
+        try {
+          const hGeneric = await Ble.addListener("notification", (result) => {
+            handleCapacitorNotif("generic", result);
+          });
+          if (hGeneric) activeBleListeners.push(hGeneric);
         } catch (e) {}
       }
 
@@ -151,10 +183,7 @@ async function connectDevice() {
           service: UART_SERVICE_UUID,
           characteristic: UART_TX_CHAR_UUID
         }, (result) => {
-          if (result) {
-            const decoded = universalBleDecode(result.value !== undefined ? result.value : result);
-            if (decoded) handleIncomingBleData(decoded, "NOTIF");
-          }
+          handleCapacitorNotif("startNotifCb", result);
         });
         appendLog("BLE", "Notifications registered on TX Characteristic.");
       } catch (notifErr) {
@@ -182,9 +211,9 @@ async function connectDevice() {
       webTxChar = await service.getCharacteristic(UART_RX_CHAR_UUID);
 
       try {
-        const rxNotifyChar = await service.getCharacteristic(UART_TX_CHAR_UUID);
-        await rxNotifyChar.startNotifications();
-        rxNotifyChar.addEventListener("characteristicvaluechanged", (e) => {
+        webNotifyChar = await service.getCharacteristic(UART_TX_CHAR_UUID);
+        await webNotifyChar.startNotifications();
+        webNotifyChar.addEventListener("characteristicvaluechanged", (e) => {
           const decoded = universalBleDecode(e.target.value);
           if (decoded) handleIncomingBleData(decoded, "WEB-BLE");
         });
@@ -195,7 +224,7 @@ async function connectDevice() {
   } catch (err) {
     appendLog("Error", `Connection failed: ${err.message || err}`);
     showToast("Bluetooth failed to connect", "error");
-    onDisconnectedCleanup();
+    await onDisconnectedCleanup();
   }
 }
 
@@ -208,7 +237,26 @@ async function disconnectDevice() {
       await webDevice.gatt.disconnect();
     }
   } catch (e) {}
-  onDisconnectedCleanup();
+  await onDisconnectedCleanup();
+}
+
+async function tryFallbackBleRead() {
+  const backend = getBleBackend();
+  try {
+    if (backend && backend.type === "capacitor" && nativeDeviceId) {
+      const res = await backend.ble.read({
+        deviceId: nativeDeviceId,
+        service: UART_SERVICE_UUID,
+        characteristic: UART_TX_CHAR_UUID
+      });
+      const decoded = universalBleDecode(res && res.value !== undefined ? res.value : res);
+      if (decoded) handleIncomingBleData(decoded, "READ");
+    } else if (webNotifyChar) {
+      const val = await webNotifyChar.readValue();
+      const decoded = universalBleDecode(val);
+      if (decoded) handleIncomingBleData(decoded, "READ");
+    }
+  } catch (e) {}
 }
 
 function onConnectedSuccess(name) {
@@ -226,22 +274,33 @@ function onConnectedSuccess(name) {
   setTimeout(() => {
     sendCommand("status");
     setTimeout(() => sendCommand("action_get"), 300);
+    setTimeout(async () => {
+      if (isConnected && rxCount === 0) {
+        await tryFallbackBleRead();
+      }
+    }, 1500);
   }, 450);
 }
 
-function onDisconnectedCleanup() {
+async function onDisconnectedCleanup() {
+  const wasConnected = isConnected;
   isConnected = false;
   nativeDeviceId = null;
   webDevice = null;
   webServer = null;
   webTxChar = null;
+  webNotifyChar = null;
   cmdQueue = [];
   isProcessingQueue = false;
   consecutiveWriteErrors = 0;
   rxLineBuffer = "";
+  activeNotifChannel = null;
+  await clearBleListeners();
   document.getElementById("device-name").innerText = "None Connected";
   setUiState("Disconnected", "#f43f5e", "Connect BLE");
-  appendLog("BLE", "Device disconnected.");
+  if (wasConnected) {
+    appendLog("BLE", "Device disconnected.");
+  }
   if (typeof applyReceivedEnableStates === "function") {
     applyReceivedEnableStates(false, false, false);
   }
@@ -300,15 +359,10 @@ function textToHexBytes(str) {
   return hex.trim();
 }
 
-function textToBase64(str) {
-  try { return btoa(str); } catch (e) { return ""; }
-}
-
 async function writeChunk(backend, chunkStr) {
   if (backend && backend.type === "capacitor" && nativeDeviceId) {
     const Ble = backend.ble;
     const hexPayload = textToHexBytes(chunkStr);
-    const b64Payload = textToBase64(chunkStr);
     try {
       await withTimeout(Ble.writeWithoutResponse({
         deviceId: nativeDeviceId,
@@ -322,7 +376,7 @@ async function writeChunk(backend, chunkStr) {
         deviceId: nativeDeviceId,
         service: UART_SERVICE_UUID,
         characteristic: UART_RX_CHAR_UUID,
-        value: b64Payload
+        value: hexPayload
       }), 2000, "BLE write");
     }
   } else if (webTxChar) {
@@ -366,7 +420,7 @@ async function executeSendCommand(commandText) {
     const lower = errMsg.toLowerCase();
     if (lower.includes("not connected") || lower.includes("disconnected") || consecutiveWriteErrors >= 2) {
       showToast("BLE link lost (possible battery sag) — reconnect", "error");
-      onDisconnectedCleanup();
+      await onDisconnectedCleanup();
     }
   }
 }
@@ -383,6 +437,20 @@ function universalBleDecode(val) {
       const buf = val.buffer ? val.buffer : val;
       if (buf instanceof ArrayBuffer || ArrayBuffer.isView(val)) {
         return new TextDecoder().decode(val);
+      }
+      if (Array.isArray(val.data)) {
+        return new TextDecoder().decode(new Uint8Array(val.data));
+      }
+      if (Array.isArray(val)) {
+        return new TextDecoder().decode(new Uint8Array(val));
+      }
+      const keys = Object.keys(val);
+      if (keys.length > 0 && keys.every(k => /^\d+$/.test(k))) {
+        const bytes = new Uint8Array(keys.length);
+        for (let i = 0; i < keys.length; i++) {
+          bytes[i] = val[i] & 0xff;
+        }
+        return new TextDecoder().decode(bytes);
       }
     } catch (e) {}
   }
@@ -518,7 +586,7 @@ function handleIncomingBleData(rawText, sourceTag = "BLE") {
       }
 
       if (ms1 && ms2 && ms3 && typeof applyReceivedAngles === "function") {
-        applyReceivedAngles(parseInt(ms1[1], 10), parseInt(ms2[1], 10), parseInt(ms3[1], 10));
+        applyReceivedAngles(parseInt(ms1[1], 10), parseInt(ms2[1], 10), parseInt(ms3[1], 10), true);
       }
       if (mo1 && mo2 && mo3 && typeof applyReceivedOffsets === "function") {
         applyReceivedOffsets(parseInt(mo1[1], 10), parseInt(mo2[1], 10), parseInt(mo3[1], 10));
@@ -559,7 +627,7 @@ function appendLog(sender, text) {
 
   const div = document.createElement("div");
   let senderColor = "#38bdf8";
-  if (sender === "NOTIF" || sender === "WEB-BLE") senderColor = "#34d399";
+  if (sender === "NOTIF" || sender === "WEB-BLE" || sender === "READ") senderColor = "#34d399";
   if (sender === "Action") senderColor = "#c084fc";
   if (sender === "Trim" || sender === "Calibration") senderColor = "#f59e0b";
   if (sender.includes("Error") || sender.includes("Warn")) senderColor = "#f87171";

@@ -1,5 +1,3 @@
-
-
 #pragma once
 
 #include <stdint.h>
@@ -16,9 +14,9 @@ extern "C" {
 #define SERVO_2_PIN         GPIO_NUM_38
 #define SERVO_3_PIN         GPIO_NUM_39
 
-// MP90S 50Hz PWM pulse bounds (0 - 180 degrees)
-#define SERVO_MIN_US        500
-#define SERVO_MAX_US        2500
+// MP90S 50Hz PWM pulse bounds (550-2450us avoids internal end-stop hunting)
+#define SERVO_MIN_US        550
+#define SERVO_MAX_US        2450
 #define SERVO_MIN_ANGLE     0
 #define SERVO_MAX_ANGLE     180
 #define SERVO_DEFAULT_ANGLE 90
@@ -68,4 +66,3 @@ bool servo_is_sequence_looping(void);
 #ifdef __cplusplus
 }
 #endif
-

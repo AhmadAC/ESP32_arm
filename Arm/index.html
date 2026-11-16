@@ -1,5 +1,3 @@
-
-
 <!DOCTYPE html>
 <html lang="en" class="h-full bg-slate-950 text-slate-100 select-none">
 <head>
@@ -44,7 +42,7 @@
     </button>
   </div>
 
-  <main style="flex:1; min-height:0; overflow-y:auto; display:flex; flex-direction:column; gap:12px; padding-right:2px;" class="no-scrollbar">
+  <main style="flex:1; min-height:0; overflow-y:auto; display:flex; flex-direction:column; gap:12px; padding-right:2px; touch-action:pan-y;" class="no-scrollbar">
 
     <!-- Quick Arm Controls -->
     <div class="glass-panel" style="border-radius:16px; padding:12px; display:flex; flex-direction:column; gap:10px;">
@@ -115,7 +113,7 @@
           </div>
           <span style="font-size:10px; color:rgba(255,255,255,0.5);">Trim: <span id="o1-val" style="color:#f59e0b; font-family:monospace; font-weight:700;">0°</span></span>
         </div>
-        <input type="range" id="s1-slider" min="0" max="180" value="90" oninput="onServoSlider(0, this.value)">
+        <input type="range" id="s1-slider" min="0" max="180" value="90" onpointerdown="onSliderStart(0)" ontouchstart="onSliderStart(0)" oninput="onServoSlider(0, this.value)" onchange="onSliderCommit(0, this.value)">
         <div class="servo-btn-row">
           <button type="button" class="trim-btn" id="s1-btn-a" onclick="servoStepAction(0, -10, -1)">-10°</button>
           <button type="button" class="trim-btn" id="s1-btn-b" onclick="servoStepAction(0, -1, 1)">-1°</button>
@@ -134,7 +132,7 @@
           </div>
           <span style="font-size:10px; color:rgba(255,255,255,0.5);">Trim: <span id="o2-val" style="color:#f59e0b; font-family:monospace; font-weight:700;">0°</span></span>
         </div>
-        <input type="range" id="s2-slider" min="0" max="180" value="90" oninput="onServoSlider(1, this.value)">
+        <input type="range" id="s2-slider" min="0" max="180" value="90" onpointerdown="onSliderStart(1)" ontouchstart="onSliderStart(1)" oninput="onServoSlider(1, this.value)" onchange="onSliderCommit(1, this.value)">
         <div class="servo-btn-row">
           <button type="button" class="trim-btn" id="s2-btn-a" onclick="servoStepAction(1, -10, -1)">-10°</button>
           <button type="button" class="trim-btn" id="s2-btn-b" onclick="servoStepAction(1, -1, 1)">-1°</button>
@@ -153,7 +151,7 @@
           </div>
           <span style="font-size:10px; color:rgba(255,255,255,0.5);">Trim: <span id="o3-val" style="color:#f59e0b; font-family:monospace; font-weight:700;">0°</span></span>
         </div>
-        <input type="range" id="s3-slider" min="0" max="180" value="90" oninput="onServoSlider(2, this.value)">
+        <input type="range" id="s3-slider" min="0" max="180" value="90" onpointerdown="onSliderStart(2)" ontouchstart="onSliderStart(2)" oninput="onServoSlider(2, this.value)" onchange="onSliderCommit(2, this.value)">
         <div class="servo-btn-row">
           <button type="button" class="trim-btn" id="s3-btn-a" onclick="servoStepAction(2, -10, -1)">-10°</button>
           <button type="button" class="trim-btn" id="s3-btn-b" onclick="servoStepAction(2, -1, 1)">-1°</button>
@@ -290,4 +288,3 @@
   <script src="app.js"></script>
 </body>
 </html>
-
