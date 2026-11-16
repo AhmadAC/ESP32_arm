@@ -5,6 +5,7 @@ idf_component_register(
         "command_processor.cpp"
         "ble_server.cpp"
         "console_serial.cpp"
+        "joystick.cpp"
     INCLUDE_DIRS "."
-    REQUIRES nvs_flash driver esp_timer bt
+    REQUIRES nvs_flash driver esp_timer bt esp_adc
 )

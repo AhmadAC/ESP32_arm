@@ -2,21 +2,34 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "driver/gpio.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-// Hardware pin definitions for PS2 Joystick & 4-Button breakout
-#define JOYSTICK_ADC_VRX_PIN    GPIO_NUM_1   // ADC1 Channel 0
-#define JOYSTICK_ADC_VRY_PIN    GPIO_NUM_2   // ADC1 Channel 1
-#define JOYSTICK_SW_PIN         GPIO_NUM_3   // Joystick Push Button (Active LOW)
-#define JOYSTICK_BTN1_PIN       GPIO_NUM_5   // Button 1 (Red / Key 1)
-#define JOYSTICK_BTN2_PIN       GPIO_NUM_6   // Button 2 (Green / Key 2)
-#define JOYSTICK_BTN3_PIN       GPIO_NUM_7   // Button 3 (Blue / Key 3)
-#define JOYSTICK_BTN4_PIN       GPIO_NUM_8   // Button 4 (Yellow / Key 4)
+// Hardware pin mapping for PS2 Joystick on YD-ESP32-S3:
+// Servo assignments:
+//   Claw     -> GPIO 1  (Servo 1)
+//   Arm      -> GPIO 38 (Servo 2)
+//   Shoulder -> GPIO 39 (Servo 3)
+//
+// Joystick module connections:
+//   GND -> GND
+//   +5V -> 3.3V (or 5V)
+//   VRX -> GPIO 2 (ADC1 Channel 1) -> Controls Arm
+//   VRY -> GPIO 3 (ADC1 Channel 2) -> Controls Shoulder
+//   SW  -> GPIO 4 (Digital Input with internal pull-up) -> Auto-Close Claw
+
+#define JOYSTICK_ADC_VRX_PIN    GPIO_NUM_2   // ADC1 Channel 1
+#define JOYSTICK_ADC_VRY_PIN    GPIO_NUM_3   // ADC1 Channel 2
+#define JOYSTICK_SW_PIN         GPIO_NUM_4   // Push button (Active LOW)
 
 void joystick_init(void);
+void joystick_set_auto_retract(bool enabled);
+bool joystick_get_auto_retract(void);
+void joystick_close_claw(void);
+void joystick_open_claw(int target_angle);
 
 #ifdef __cplusplus
 }

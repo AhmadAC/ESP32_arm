@@ -8,6 +8,7 @@
 #include "ble_server.h"
 #include "console_serial.h"
 #include "command_processor.h"
+#include "joystick.h"
 
 static const char *TAG = "APP_MAIN";
 
@@ -45,11 +46,14 @@ extern "C" void app_main(void) {
     // 3. Bluetooth Low Energy NUS Server ('ESP32S3-Arm') initialized BEFORE servo PWM
     ble_server_init(command_on_ble_received);
 
-    // 4. 3-Servo LEDC PWM Controller (starts DETACHED / duty=0 on GPIO 1, 38, 39)
+    // 4. 3-Servo LEDC PWM Controller (starts DETACHED / duty=0 on Claw=GP1, Arm=GP38, Shoulder=GP39)
     servo_controller_init();
 
-    // 5. Serial Console (UART0 & Native USB-Serial-JTAG REPL)
+    // 5. PS2 Joystick Controller (VRX=GP2, VRY=GP3, SW=GP4)
+    joystick_init();
+
+    // 6. Serial Console (UART0 & Native USB-Serial-JTAG REPL)
     console_serial_init();
 
-    ESP_LOGI(TAG, "All subsystems running. Servos idle until commanded.");
+    ESP_LOGI(TAG, "All subsystems running. Arm ready for PS2 Joystick & BLE control.");
 }

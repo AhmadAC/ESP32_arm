@@ -1,8 +1,6 @@
-// main/joystick.cpp
 #include "joystick.h"
 #include "servo_controller.h"
 #include "command_processor.h"
-#include "audio_player.h"
 #include "console_serial.h"
 #include "ble_server.h"
 
@@ -18,26 +16,23 @@ static const char *TAG = "JOYSTICK";
 
 static adc_oneshot_unit_handle_t adc1_handle = NULL;
 
-#define ADC_VRX_CHANNEL     ADC_CHANNEL_0  // GPIO 1
-#define ADC_VRY_CHANNEL     ADC_CHANNEL_1  // GPIO 2
+#define ADC_VRX_CHANNEL     ADC_CHANNEL_1  // GPIO 2
+#define ADC_VRY_CHANNEL     ADC_CHANNEL_2  // GPIO 3
 
-#define ADC_EFF_MIN         100.0f         // Reliable low-end pot rail
-#define ADC_EFF_MAX         3995.0f        // Reliable high-end pot rail (below 4095 saturation)
-#define ADC_MIN_SPAN        200.0f         // Minimum span guard against division by zero
-#define DEADZONE_NORM       0.14f          // ~14% radial center deadzone
-#define EMA_ALPHA           0.45f          // Smoothing factor for jitter-free 1-deg precision
-#define RESPONSE_GAMMA      1.35f          // Gentle curve for fine 1-deg control near small angles
-#define ADC_AVG_SAMPLES     8              // Multi-sample read per poll tick
+#define ADC_EFF_MIN         80.0f
+#define ADC_EFF_MAX         4000.0f
+#define ADC_MIN_SPAN        250.0f
+#define DEADZONE_NORM       0.15f
+#define EMA_ALPHA           0.35f
+#define SLEW_SPEED_DEG      1.75f          // Max degrees change per 20ms tick (~87 deg/s)
+#define CLAW_INDEX          0              // Servo 1 on GPIO 1
+#define ARM_INDEX           1              // Servo 2 on GPIO 38
+#define SHOULDER_INDEX      2              // Servo 3 on GPIO 39
+#define CLAW_CLOSED_ANGLE   0              // Angle when claw is fully closed
+#define CLAW_OPEN_ANGLE     130            // Default angle when claw is opened
 
-static const gpio_num_t BUTTON_PINS[] = {
-    JOYSTICK_SW_PIN,
-    JOYSTICK_BTN1_PIN,
-    JOYSTICK_BTN2_PIN,
-    JOYSTICK_BTN3_PIN,
-    JOYSTICK_BTN4_PIN
-};
-
-#define NUM_BUTTONS (sizeof(BUTTON_PINS) / sizeof(BUTTON_PINS[0]))
+static bool s_auto_retract_enabled = true;
+static bool s_claw_was_deflected   = false;
 
 static float read_adc_avg(adc_channel_t channel, int samples) {
     long sum = 0;
@@ -68,10 +63,41 @@ static float normalize_axis(float val, float center) {
     }
 }
 
+void joystick_set_auto_retract(bool enabled) {
+    s_auto_retract_enabled = enabled;
+    command_set_auto_retract(enabled);
+    ESP_LOGI(TAG, "Claw Auto-Retract set to %s", enabled ? "ENABLED" : "DISABLED");
+}
+
+bool joystick_get_auto_retract(void) {
+    return s_auto_retract_enabled;
+}
+
+void joystick_close_claw(void) {
+    servo_set_angle(CLAW_INDEX, CLAW_CLOSED_ANGLE);
+    s_claw_was_deflected = false;
+    char msg[64];
+    snprintf(msg, sizeof(msg), ">> [Joystick SW] Claw Auto-Closed to %d deg\n", CLAW_CLOSED_ANGLE);
+    console_print(msg);
+    ble_server_send_notify("CLAW:0\n");
+    command_notify_status();
+}
+
+void joystick_open_claw(int target_angle) {
+    if (target_angle < SERVO_MIN_ANGLE) target_angle = SERVO_MIN_ANGLE;
+    if (target_angle > SERVO_MAX_ANGLE) target_angle = SERVO_MAX_ANGLE;
+    servo_set_angle(CLAW_INDEX, target_angle);
+    char msg[64];
+    snprintf(msg, sizeof(msg), ">> Claw Opened to %d deg\n", target_angle);
+    console_print(msg);
+    ble_server_send_notify("CLAW:OPEN\n");
+    command_notify_status();
+}
+
 static void joystick_poll_task(void *pvParameters) {
     (void)pvParameters;
 
-    // 1. Initial ADC Calibration / Center Baseline determination
+    // 1. Initial ADC Calibration / Baseline determination
     float accum_x = 0.0f;
     float accum_y = 0.0f;
     const int CAL_SAMPLES = 32;
@@ -87,25 +113,26 @@ static void joystick_poll_task(void *pvParameters) {
     float filt_x = center_x;
     float filt_y = center_y;
 
-    ESP_LOGI(TAG, "PS2 Joystick Calibrated Center -> X: %.1f, Y: %.1f (360-deg radial -> %d-%d deg)",
-             center_x, center_y, SERVO_MIN_ANGLE, SERVO_MAX_ANGLE);
+    ESP_LOGI(TAG, "PS2 Joystick Calibrated Center -> X: %.1f, Y: %.1f (VRX->GP38 Arm, VRY->GP39 Shoulder, SW->GP1 Claw)",
+             center_x, center_y);
 
-    bool was_deflected = false;
-    bool prev_auto_retract = command_get_auto_retract();
-    int last_applied_angle = servo_get_angle();
-    bool pending_notify = false;
+    // Track active target angles as floats for sub-degree smooth slewing
+    float arm_f = (float)servo_get_angle(ARM_INDEX);
+    float shoulder_f = (float)servo_get_angle(SHOULDER_INDEX);
+
+    // Debounce tracking for SW push button
+    uint8_t sw_press_count = 0;
+    uint8_t sw_release_count = 0;
+    bool sw_down = false;
+    const uint8_t DEBOUNCE_TICKS = 2; // ~40ms debounce
+
     TickType_t last_notify_tick = 0;
-
-    // Button debounce tracking
-    uint8_t press_count[NUM_BUTTONS] = {0};
-    uint8_t release_count[NUM_BUTTONS] = {0};
-    bool btn_state[NUM_BUTTONS] = {false};
-    const uint8_t DEBOUNCE_THRESHOLD = 3;
+    bool pending_status_notify = false;
 
     while (1) {
-        // --- 1. Read & Filter Analog Joystick Axes (360-Degree Radial Control) ---
-        float raw_x = read_adc_avg(ADC_VRX_CHANNEL, ADC_AVG_SAMPLES);
-        float raw_y = read_adc_avg(ADC_VRY_CHANNEL, ADC_AVG_SAMPLES);
+        // --- 1. Read & Filter Analog Joystick Axes ---
+        float raw_x = read_adc_avg(ADC_VRX_CHANNEL, 6);
+        float raw_y = read_adc_avg(ADC_VRY_CHANNEL, 6);
 
         filt_x += EMA_ALPHA * (raw_x - filt_x);
         filt_y += EMA_ALPHA * (raw_y - filt_y);
@@ -113,139 +140,111 @@ static void joystick_poll_task(void *pvParameters) {
         float nx = normalize_axis(filt_x, center_x);
         float ny = normalize_axis(filt_y, center_y);
 
-        // Radial magnitude in all 360 degrees around center
         float mag = sqrtf((nx * nx) + (ny * ny));
         if (mag > 1.0f) mag = 1.0f;
 
-        bool cur_auto_retract = command_get_auto_retract();
-        bool in_deflection = (mag > DEADZONE_NORM);
+        bool in_motion = (mag > DEADZONE_NORM);
 
-        // If Auto-Retract was just switched ON while joystick rests at center, retract immediately
-        if (!prev_auto_retract && cur_auto_retract) {
-            if (!in_deflection && servo_get_angle() > SERVO_MIN_ANGLE) {
-                servo_set_angle(SERVO_MIN_ANGLE);
-                last_applied_angle = SERVO_MIN_ANGLE;
-                pending_notify = false;
-                command_notify_status();
-                last_notify_tick = xTaskGetTickCount();
-                console_print(">> Auto-Retract Enabled -> Claw Retracted to 0 deg\n");
-                ble_server_send_notify("AUTORETRACT:RETRACTED\n");
-            }
-        }
-        prev_auto_retract = cur_auto_retract;
+        // --- 2. Read SW Push Button (Active LOW) ---
+        int sw_level = gpio_get_level(JOYSTICK_SW_PIN);
+        bool sw_is_pressed = (sw_level == 0);
 
-        if (in_deflection) {
-            if (!was_deflected) {
-                was_deflected = true;
-                last_applied_angle = servo_get_angle();
-            }
-
-            float effective = (mag - DEADZONE_NORM) / (1.0f - DEADZONE_NORM);
-            if (effective < 0.0f) effective = 0.0f;
-            if (effective > 1.0f) effective = 1.0f;
-
-            // Gentle curve provides fine 1-degree thumb control at small/mid openings
-            float curved = powf(effective, RESPONSE_GAMMA);
-            int target_angle = (int)lroundf(curved * (float)(SERVO_MAX_ANGLE - SERVO_MIN_ANGLE)) + SERVO_MIN_ANGLE;
-
-            if (target_angle < SERVO_MIN_ANGLE) target_angle = SERVO_MIN_ANGLE;
-            if (target_angle > SERVO_MAX_ANGLE) target_angle = SERVO_MAX_ANGLE;
-
-            if (target_angle != last_applied_angle) {
-                last_applied_angle = target_angle;
-                servo_set_angle(target_angle);
-                pending_notify = true;
-            }
-
-            if (pending_notify && (xTaskGetTickCount() - last_notify_tick) >= pdMS_TO_TICKS(60)) {
-                command_notify_status();
-                last_notify_tick = xTaskGetTickCount();
-                pending_notify = false;
+        if (sw_is_pressed) {
+            sw_release_count = 0;
+            if (sw_press_count < DEBOUNCE_TICKS) {
+                sw_press_count++;
+                if (sw_press_count >= DEBOUNCE_TICKS && !sw_down) {
+                    sw_down = true;
+                    // Click Event: Auto-close the claw (GPIO 1)
+                    int cur_claw = servo_get_angle(CLAW_INDEX);
+                    if (cur_claw <= 10) {
+                        // If already closed, a click opens the claw
+                        joystick_open_claw(CLAW_OPEN_ANGLE);
+                    } else {
+                        // Otherwise, immediately auto-close
+                        joystick_close_claw();
+                    }
+                }
             }
         } else {
-            // Joystick is resting inside Center Deadzone
-            if (was_deflected) {
-                was_deflected = false;
-                if (cur_auto_retract) {
-                    servo_set_angle(SERVO_MIN_ANGLE);
-                    last_applied_angle = SERVO_MIN_ANGLE;
-                    pending_notify = false;
-                    command_notify_status();
-                    last_notify_tick = xTaskGetTickCount();
-                    console_print(">> PS2 Joystick Centered -> Auto-Retracted to 0 deg\n");
-                    ble_server_send_notify("AUTORETRACT:RETRACTED\n");
-                } else if (pending_notify) {
-                    command_notify_status();
-                    last_notify_tick = xTaskGetTickCount();
-                    pending_notify = false;
-                }
-            } else if (pending_notify) {
-                command_notify_status();
-                last_notify_tick = xTaskGetTickCount();
-                pending_notify = false;
-            }
-        }
-
-        // --- 2. Read SW and Push Buttons ---
-        for (size_t b = 0; b < NUM_BUTTONS; b++) {
-            int level = gpio_get_level(BUTTON_PINS[b]);
-            bool is_down = (level == 0); // Active LOW
-
-            if (is_down) {
-                release_count[b] = 0;
-                if (press_count[b] < DEBOUNCE_THRESHOLD) {
-                    press_count[b]++;
-                    if (press_count[b] >= DEBOUNCE_THRESHOLD && !btn_state[b]) {
-                        btn_state[b] = true;
-
-                        if (BUTTON_PINS[b] == JOYSTICK_SW_PIN) {
-                            // SW Click: Toggle Auto-Retract mode
-                            bool current_mode = command_get_auto_retract();
-                            command_set_auto_retract(!current_mode);
-                            char log_msg[64];
-                            snprintf(log_msg, sizeof(log_msg), ">> [Joystick SW] Auto-Retract Toggled: %s\n",
-                                     !current_mode ? "ON" : "OFF");
-                            console_print(log_msg);
-                        } else if (BUTTON_PINS[b] == JOYSTICK_BTN1_PIN) {
-                            // K1 (Red): Open Claw to hard limit (135 deg)
-                            console_print(">> [Joystick Button 1 / RED] -> Open Claw (135 deg limit)\n");
-                            command_on_keypad_event(4, "135", true);
-                        } else if (BUTTON_PINS[b] == JOYSTICK_BTN2_PIN) {
-                            // K2 (Green): Set Claw to Center (90 deg)
-                            console_print(">> [Joystick Button 2 / GREEN] -> Center Claw (90 deg)\n");
-                            command_on_keypad_event(3, "90", true);
-                        } else if (BUTTON_PINS[b] == JOYSTICK_BTN3_PIN) {
-                            // K3 (Blue): Play Dog Bark Sound
-                            console_print(">> [Joystick Button 3 / BLUE] -> Bark Sound\n");
-                            command_process("bark", console_print);
-                        } else if (BUTTON_PINS[b] == JOYSTICK_BTN4_PIN) {
-                            // K4 (Yellow): Play Diagnostic Beep
-                            console_print(">> [Joystick Button 4 / YELLOW] -> Diagnostic Beep\n");
-                            command_process("beep", console_print);
-                        }
+            sw_press_count = 0;
+            if (sw_down) {
+                if (sw_release_count < DEBOUNCE_TICKS) {
+                    sw_release_count++;
+                    if (sw_release_count >= DEBOUNCE_TICKS) {
+                        sw_down = false;
+                        sw_release_count = 0;
                     }
                 }
             } else {
-                press_count[b] = 0;
-                if (btn_state[b]) {
-                    if (release_count[b] < DEBOUNCE_THRESHOLD) {
-                        release_count[b]++;
-                        if (release_count[b] >= DEBOUNCE_THRESHOLD) {
-                            btn_state[b] = false;
-                            release_count[b] = 0;
+                sw_release_count = 0;
+            }
+        }
 
-                            // Edge detection release: trigger auto-retract if hold-to-open button was released
-                            if (BUTTON_PINS[b] == JOYSTICK_BTN1_PIN) {
-                                command_on_keypad_event(4, "135", false);
-                            } else if (BUTTON_PINS[b] == JOYSTICK_BTN2_PIN) {
-                                command_on_keypad_event(3, "90", false);
-                            }
-                        }
-                    }
-                } else {
-                    release_count[b] = 0;
+        // --- 3. Process Motion Control ---
+        if (in_motion) {
+            float eff_mag = (mag - DEADZONE_NORM) / (1.0f - DEADZONE_NORM);
+            if (eff_mag > 1.0f) eff_mag = 1.0f;
+
+            if (sw_down) {
+                // If button is held down while moving joystick: open claw proportionally to deflection
+                int claw_target = CLAW_CLOSED_ANGLE + (int)lroundf(eff_mag * (float)(CLAW_OPEN_ANGLE - CLAW_CLOSED_ANGLE));
+                servo_set_angle(CLAW_INDEX, claw_target);
+                s_claw_was_deflected = true;
+                pending_status_notify = true;
+            } else {
+                // Normal mode: VRX controls Arm (GPIO 38) and VRY controls Shoulder (GPIO 39)
+                float eff_x = 0.0f;
+                float eff_y = 0.0f;
+
+                if (fabsf(nx) > DEADZONE_NORM) {
+                    eff_x = (fabsf(nx) - DEADZONE_NORM) / (1.0f - DEADZONE_NORM);
+                    if (nx < 0.0f) eff_x = -eff_x;
+                }
+                if (fabsf(ny) > DEADZONE_NORM) {
+                    eff_y = (fabsf(ny) - DEADZONE_NORM) / (1.0f - DEADZONE_NORM);
+                    if (ny < 0.0f) eff_y = -eff_y;
+                }
+
+                // Slew Arm (Servo 2 / GPIO 38)
+                if (fabsf(eff_x) > 0.01f) {
+                    arm_f += eff_x * SLEW_SPEED_DEG;
+                    if (arm_f < (float)SERVO_MIN_ANGLE) arm_f = (float)SERVO_MIN_ANGLE;
+                    if (arm_f > (float)SERVO_MAX_ANGLE) arm_f = (float)SERVO_MAX_ANGLE;
+                    servo_set_angle(ARM_INDEX, (int)lroundf(arm_f));
+                    pending_status_notify = true;
+                }
+
+                // Slew Shoulder (Servo 3 / GPIO 39)
+                if (fabsf(eff_y) > 0.01f) {
+                    shoulder_f += eff_y * SLEW_SPEED_DEG;
+                    if (shoulder_f < (float)SERVO_MIN_ANGLE) shoulder_f = (float)SERVO_MIN_ANGLE;
+                    if (shoulder_f > (float)SERVO_MAX_ANGLE) shoulder_f = (float)SERVO_MAX_ANGLE;
+                    servo_set_angle(SHOULDER_INDEX, (int)lroundf(shoulder_f));
+                    pending_status_notify = true;
                 }
             }
+        } else {
+            // --- 4. Joystick Stopped Moving (Inside Deadzone) -> Claw Auto-Retract ---
+            // If Auto-Retract is enabled and the claw was previously opened or deflected
+            if (s_auto_retract_enabled && s_claw_was_deflected) {
+                s_claw_was_deflected = false;
+                servo_set_angle(CLAW_INDEX, CLAW_CLOSED_ANGLE);
+                console_print(">> Joystick Centered -> Claw Auto-Retracted to 0 deg\n");
+                ble_server_send_notify("AUTORETRACT:RETRACTED\n");
+                pending_status_notify = true;
+            }
+
+            // Sync internal float tracking with any external BLE/Console angle overrides
+            arm_f = (float)servo_get_angle(ARM_INDEX);
+            shoulder_f = (float)servo_get_angle(SHOULDER_INDEX);
+        }
+
+        // Throttle periodic status notification over BLE / Console during joystick deflection
+        if (pending_status_notify && (xTaskGetTickCount() - last_notify_tick) >= pdMS_TO_TICKS(120)) {
+            command_notify_status();
+            last_notify_tick = xTaskGetTickCount();
+            pending_status_notify = false;
         }
 
         vTaskDelay(pdMS_TO_TICKS(20));
@@ -253,7 +252,7 @@ static void joystick_poll_task(void *pvParameters) {
 }
 
 void joystick_init(void) {
-    // 1. Configure ADC1 for VRX (GPIO 1) and VRY (GPIO 2)
+    // 1. Configure ADC1 for VRX (GPIO 2) and VRY (GPIO 3)
     adc_oneshot_unit_init_cfg_t init_config1 = {
         .unit_id = ADC_UNIT_1,
         .clk_src = ADC_RTC_CLK_SRC_DEFAULT,
@@ -272,20 +271,17 @@ void joystick_init(void) {
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, ADC_VRX_CHANNEL, &config));
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, ADC_VRY_CHANNEL, &config));
 
-    // 2. Configure SW and Buttons GPIOs as Inputs with Internal Pull-Up
+    // 2. Configure SW Click Pin (GPIO 4) as Input with Internal Pull-Up
     gpio_config_t btn_cfg = {};
     btn_cfg.mode = GPIO_MODE_INPUT;
     btn_cfg.pull_up_en = GPIO_PULLUP_ENABLE;
     btn_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
     btn_cfg.intr_type = GPIO_INTR_DISABLE;
-
-    for (size_t i = 0; i < NUM_BUTTONS; i++) {
-        btn_cfg.pin_bit_mask |= (1ULL << BUTTON_PINS[i]);
-    }
+    btn_cfg.pin_bit_mask = (1ULL << JOYSTICK_SW_PIN);
     ESP_ERROR_CHECK(gpio_config(&btn_cfg));
 
     // 3. Launch background polling task
     xTaskCreatePinnedToCore(joystick_poll_task, "joystick_task", 4096, NULL, 4, NULL, 1);
 
-    ESP_LOGI(TAG, "PS2 Joystick & Buttons Subsystem initialized (VRX: GP1, VRY: GP2, SW: GP3, K1..K4: GP5..8)");
+    ESP_LOGI(TAG, "PS2 Joystick Initialized: VRX=GPIO2 (Arm), VRY=GPIO3 (Shoulder), SW=GPIO4 (Claw Auto-Close)");
 }

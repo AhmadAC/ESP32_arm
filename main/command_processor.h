@@ -1,4 +1,3 @@
-
 #pragma once
 
 #include <stdint.h>
@@ -14,6 +13,9 @@ void command_processor_init(void);
 void command_process(const char *cmd_line, command_print_fn_t print_fn);
 void command_notify_status(void);
 void command_on_ble_received(const char *cmd, void (*reply_fn)(const char *reply));
+
+void command_set_auto_retract(bool en);
+bool command_get_auto_retract(void);
 
 #ifdef __cplusplus
 }

@@ -1,19 +1,35 @@
-
 ================================================================================
               YD-ESP32-S3 3-SERVO ARM HARDWARE PINOUT MAPPING
 ================================================================================
 
 1. MP90S SERVO MOTOR WIRING (3-AXIS SERVO ARM):
 --------------------------------------------------------------------------------
-Servo Channel   Lead Color          YD-ESP32-S3 Pin     Notes
-Common GND      Black / Brown       GND                 Common Ground (Share w/ PSU)
-Servo Power     Red                 External 5V         5V 2A+ external supply recommended
-Servo 1 (S1)    Orange / Yellow     GPIO 1              50Hz LEDC PWM (500-2500us)
-Servo 2 (S2)    Orange / Yellow     GPIO 38             50Hz LEDC PWM (500-2500us)
-Servo 3 (S3)    Orange / Yellow     GPIO 39             50Hz LEDC PWM (500-2500us)
+Servo Channel   Joint           YD-ESP32-S3 Pin     Notes
+Common GND      Ground          GND                 Common Ground (Share w/ PSU)
+Servo Power     5V Power        External 5V         5V 2A+ external supply recommended
+Servo 1 (S1)    Claw (Gripper)  GPIO 1              50Hz LEDC PWM (500-2450us)
+Servo 2 (S2)    Arm             GPIO 38             50Hz LEDC PWM (500-2450us)
+Servo 3 (S3)    Shoulder        GPIO 39             50Hz LEDC PWM (500-2450us)
 
 
-2. BLUETOOTH LOW ENERGY (BLE) SPECIFICATION:
+2. PS2 DUAL-AXIS ANALOG JOYSTICK & PUSH BUTTON WIRING:
+--------------------------------------------------------------------------------
+Joystick Pin    Wire Color      YD-ESP32-S3 Pin     Function
+GND             Purple          GND                 Common Ground
++5V             Blue            3.3V (or 5V)        VCC Power Rail
+VRx             Yellow          GPIO 2 (ADC1_CH1)   Controls Arm (GPIO 38)
+VRy             Orange          GPIO 3 (ADC1_CH2)   Controls Shoulder (GPIO 39)
+SW              Green           GPIO 4              Click to Auto-Close Claw (GPIO 1)
+
+CONTROL BEHAVIOR:
+- Deflecting VRx slews the Arm (GPIO 38). When centered, Arm HOLDS position.
+- Deflecting VRy slews the Shoulder (GPIO 39). When centered, Shoulder HOLDS position.
+- Clicking SW instantly auto-closes the Claw (GPIO 1) to 0 degrees.
+- Holding SW and deflecting stick opens Claw. Releasing the stick triggers
+  AUTO-RETRACT: only the claw automatically closes, while Arm & Shoulder stay put.
+
+
+3. BLUETOOTH LOW ENERGY (BLE) SPECIFICATION:
 --------------------------------------------------------------------------------
 Device Advertised Name:     ESP32S3-Arm
 GATT Service (NUS):         6e400001-b5a3-f393-e0a9-e50e24dcca9e
@@ -21,23 +37,16 @@ RX Characteristic (Write):  6e400002-b5a3-f393-e0a9-e50e24dcca9e
 TX Characteristic (Notify): 6e400003-b5a3-f393-e0a9-e50e24dcca9e
 
 
-3. BLE & USB SERIAL COMMAND REFERENCE:
+4. BLE & USB SERIAL COMMAND REFERENCE:
 --------------------------------------------------------------------------------
 - s1 <0-180> / s2 <0-180> / s3 <0-180> : Move individual servo immediately
+- claw <0-180|open|close>             : Control Claw (GPIO 1)
+- arm <0-180>                          : Control Arm (GPIO 38)
+- shoulder <0-180>                     : Control Shoulder (GPIO 39)
+- autoretract <on|off>                 : Toggle Claw Auto-Retract mode
 - set <s1> <s2> <s3>                   : Move all 3 servos immediately
 - move <s1> <s2> <s3> [ms]             : Smoothly ease all 3 servos over duration
-- nudge <s1|s2|s3> <+/-deg>            : Increment/decrement a single servo
 - home                                 : Smoothly move all 3 servos to 90 deg
 - stop                                 : Stop any running action or loop
-- offset <s1|s2|s3> <-45..45>          : Live trim calibration preview
-- cal_set <o1> <o2> <o3>               : Save all 3 trim offsets to NVS Flash
-- cal_get                              : Query saved trim offsets (CAL:o1,o2,o3)
-- action_run <1-8>                     : Run programmable action slot 1-8 once
-- action_loop <1-8>                    : Loop programmable action slot 1-8
-- action_set <1-8> <name>|<steps>      : Save action slot to NVS Flash
-- action_get                           : Read all 8 action slots
-- action_reset                         : Restore factory default action slots
-- seq <s1,s2,s3,move_ms,wait_ms;...>   : Run ad-hoc multi-step sequence
-- seq_loop <steps>                     : Loop ad-hoc multi-step sequence
 - status                               : Query live angles, offsets, run state
 ================================================================================

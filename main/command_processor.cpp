@@ -1,5 +1,6 @@
 #include "command_processor.h"
 #include "servo_controller.h"
+#include "joystick.h"
 #include "ble_server.h"
 #include "esp_system.h"
 #include "esp_log.h"
@@ -11,17 +12,26 @@
 #include <ctype.h>
 
 static const char *TAG = "CMD_PROC";
+static bool s_auto_retract = true;
 
 static int parse_servo_index(const char *token) {
     if (!token) return -1;
-    if (strcmp(token, "1") == 0 || strcasecmp(token, "s1") == 0) return 0;
-    if (strcmp(token, "2") == 0 || strcasecmp(token, "s2") == 0) return 1;
-    if (strcmp(token, "3") == 0 || strcasecmp(token, "s3") == 0) return 2;
+    if (strcmp(token, "1") == 0 || strcasecmp(token, "s1") == 0 || strcasecmp(token, "claw") == 0) return 0;
+    if (strcmp(token, "2") == 0 || strcasecmp(token, "s2") == 0 || strcasecmp(token, "arm") == 0) return 1;
+    if (strcmp(token, "3") == 0 || strcasecmp(token, "s3") == 0 || strcasecmp(token, "shoulder") == 0) return 2;
     return -1;
 }
 
+void command_set_auto_retract(bool en) {
+    s_auto_retract = en;
+}
+
+bool command_get_auto_retract(void) {
+    return s_auto_retract;
+}
+
 void command_processor_init(void) {
-    ESP_LOGI(TAG, "Command Processor Initialized (3x MP90S Servo Arm: GPIO 1, 38, 39)");
+    ESP_LOGI(TAG, "Command Processor Initialized (Claw: GPIO 1, Arm: GPIO 38, Shoulder: GPIO 39)");
 }
 
 void command_notify_status(void) {
@@ -35,16 +45,17 @@ void command_notify_status(void) {
     servo_get_all_enabled(&e1, &e2, &e3);
     int brownout = (esp_reset_reason() == ESP_RST_BROWNOUT) ? 1 : 0;
 
-    char status_str[200];
+    char status_str[220];
     snprintf(status_str, sizeof(status_str),
-             "STATUS:s1=%d,s2=%d,s3=%d,o1=%d,o2=%d,o3=%d,en1=%d,en2=%d,en3=%d,idle=%d,run=%d,act=%d,loop=%d,bo=%d\n",
+             "STATUS:s1=%d,s2=%d,s3=%d,o1=%d,o2=%d,o3=%d,en1=%d,en2=%d,en3=%d,idle=%d,run=%d,act=%d,loop=%d,bo=%d,ar=%d\n",
              s1, s2, s3, o1, o2, o3,
              e1 ? 1 : 0, e2 ? 1 : 0, e3 ? 1 : 0,
              servo_get_auto_idle() ? 1 : 0,
              servo_is_sequence_running() ? 1 : 0,
              servo_get_active_slot(),
              servo_is_sequence_looping() ? 1 : 0,
-             brownout);
+             brownout,
+             s_auto_retract ? 1 : 0);
     ble_server_send_notify(status_str);
 }
 
@@ -54,6 +65,61 @@ void command_process(const char *cmd_line, command_print_fn_t print_fn) {
     const char *p = cmd_line;
     while (*p == ' ' || *p == '\t') p++;
     if (*p == '\0') return;
+
+    // Direct Named Joint Controls: "claw <0-180|open|close>"
+    if (strncmp(p, "claw ", 5) == 0) {
+        const char *arg = p + 5;
+        if (strcasecmp(arg, "close") == 0) {
+            joystick_close_claw();
+            print_fn(">> Claw auto-closed (0 deg)\n");
+            return;
+        } else if (strcasecmp(arg, "open") == 0) {
+            joystick_open_claw(130);
+            print_fn(">> Claw opened (130 deg)\n");
+            return;
+        } else {
+            int angle = atoi(arg);
+            if (angle >= SERVO_MIN_ANGLE && angle <= SERVO_MAX_ANGLE) {
+                servo_set_angle(0, angle);
+                char msg[48];
+                snprintf(msg, sizeof(msg), "ANG:%d,%d,%d\n", angle, servo_get_angle(1), servo_get_angle(2));
+                print_fn(msg);
+                return;
+            }
+        }
+    }
+
+    if (strncmp(p, "arm ", 4) == 0) {
+        int angle = atoi(p + 4);
+        if (angle >= SERVO_MIN_ANGLE && angle <= SERVO_MAX_ANGLE) {
+            servo_set_angle(1, angle);
+            char msg[48];
+            snprintf(msg, sizeof(msg), "ANG:%d,%d,%d\n", servo_get_angle(0), angle, servo_get_angle(2));
+            print_fn(msg);
+            return;
+        }
+    }
+
+    if (strncmp(p, "shoulder ", 9) == 0) {
+        int angle = atoi(p + 9);
+        if (angle >= SERVO_MIN_ANGLE && angle <= SERVO_MAX_ANGLE) {
+            servo_set_angle(2, angle);
+            char msg[48];
+            snprintf(msg, sizeof(msg), "ANG:%d,%d,%d\n", servo_get_angle(0), servo_get_angle(1), angle);
+            print_fn(msg);
+            return;
+        }
+    }
+
+    // Auto-Retract toggle: "autoretract <on|off>"
+    if (strncmp(p, "autoretract ", 12) == 0) {
+        bool en = (strcasecmp(p + 12, "on") == 0 || strcmp(p + 12, "1") == 0 || strcasecmp(p + 12, "true") == 0);
+        joystick_set_auto_retract(en);
+        char msg[48];
+        snprintf(msg, sizeof(msg), "AUTORETRACT:%d\n", en ? 1 : 0);
+        print_fn(msg);
+        return;
+    }
 
     // Single servo angle commands: "s1 90", "s2 45", "s3 150"
     if ((p[0] == 's' || p[0] == 'S') && (p[1] >= '1' && p[1] <= '3') && (p[2] == ' ' || p[2] == ':')) {
@@ -309,38 +375,32 @@ void command_process(const char *cmd_line, command_print_fn_t print_fn) {
         servo_get_all_offsets(&o1, &o2, &o3);
         servo_get_all_enabled(&e1, &e2, &e3);
         int brownout = (esp_reset_reason() == ESP_RST_BROWNOUT) ? 1 : 0;
-        char msg[200];
+        char msg[220];
         snprintf(msg, sizeof(msg),
-                 "STATUS:s1=%d,s2=%d,s3=%d,o1=%d,o2=%d,o3=%d,en1=%d,en2=%d,en3=%d,idle=%d,run=%d,act=%d,loop=%d,bo=%d\n",
+                 "STATUS:s1=%d,s2=%d,s3=%d,o1=%d,o2=%d,o3=%d,en1=%d,en2=%d,en3=%d,idle=%d,run=%d,act=%d,loop=%d,bo=%d,ar=%d\n",
                  s1, s2, s3, o1, o2, o3,
                  e1 ? 1 : 0, e2 ? 1 : 0, e3 ? 1 : 0,
                  servo_get_auto_idle() ? 1 : 0,
                  servo_is_sequence_running() ? 1 : 0,
                  servo_get_active_slot(),
                  servo_is_sequence_looping() ? 1 : 0,
-                 brownout);
+                 brownout,
+                 s_auto_retract ? 1 : 0);
         print_fn(msg);
         return;
     }
 
     if (strcmp(p, "help") == 0 || strcmp(p, "?") == 0) {
-        print_fn("3-Servo MP90S Arm Commands (GPIO 1, 38, 39):\n"
-                 "  s1 <0-180> / s2 <0-180> / s3 <0-180> : Move & enable individual servo\n"
-                 "  set <s1> <s2> <s3>                   : Smooth move all 3\n"
-                 "  move <s1> <s2> <s3> [ms]             : Smooth move all 3\n"
-                 "  nudge <s1|s2|s3> <+/-deg>            : Fine-step nudge\n"
-                 "  home                                 : Center all to 90 deg\n"
-                 "  stop                                 : Stop sequence motion\n"
-                 "  detach / attach                      : Cut or restore PWM output\n"
-                 "  autoidle <on|off>                    : Auto-detach 1.2s after move\n"
-                 "  offset <s1|s2|s3> <-45..45>          : Live trim offset\n"
-                 "  cal_set <o1> <o2> <o3>               : Save trim to NVS Flash\n"
-                 "  cal_get                              : Read trim offsets\n"
-                 "  action_run <1-8> / action_loop <1-8> : Run/loop saved action\n"
-                 "  action_set <1-8> <name>|<steps>      : Save action to NVS\n"
-                 "  action_get / action_reset            : Read or reset actions\n"
-                 "  seq <steps> / seq_loop <steps>       : Run ad-hoc steps\n"
-                 "  status / reboot                      : Status or restart\n");
+        print_fn("3-Servo Arm (Claw=GP1, Arm=GP38, Shoulder=GP39) + Joystick:\n"
+                 "  claw <0-180|open|close>              : Direct Claw command\n"
+                 "  arm <0-180> / shoulder <0-180>       : Move Arm or Shoulder\n"
+                 "  autoretract <on|off>                 : Toggle Claw Auto-Retract\n"
+                 "  s1 <deg> / s2 <deg> / s3 <deg>       : Move specific servo\n"
+                 "  set <s1> <s2> <s3>                   : Move all 3 servos\n"
+                 "  move <s1> <s2> <s3> [ms]             : Smooth ease all 3\n"
+                 "  home / stop / detach / attach        : Quick control\n"
+                 "  action_run <1-8> / action_loop <1-8> : Saved routine\n"
+                 "  status                               : Print full system state\n");
         return;
     }
 
