@@ -1,3 +1,5 @@
+
+
 #pragma once
 
 #include <stdint.h>
@@ -37,6 +39,15 @@ void servo_move_smooth(int s1, int s2, int s3, int duration_ms);
 int  servo_get_angle(int idx);
 void servo_get_all_angles(int *s1, int *s2, int *s3);
 
+// Servo power / PWM attach & detach (idle = 0 duty, no self-movement or holding current)
+void servo_detach(int idx);
+void servo_detach_all(void);
+void servo_attach_all(void);
+bool servo_is_enabled(int idx);
+void servo_get_all_enabled(bool *e1, bool *e2, bool *e3);
+void servo_set_auto_idle(bool enabled);
+bool servo_get_auto_idle(void);
+
 // Calibration trim offsets (saved to NVS Flash)
 void servo_set_offset(int idx, int offset);
 int  servo_get_offset(int idx);
@@ -57,3 +68,4 @@ bool servo_is_sequence_looping(void);
 #ifdef __cplusplus
 }
 #endif
+

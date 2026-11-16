@@ -10,17 +10,13 @@ CONFIG_FREERTOS_HZ=1000
 # Compiler Optimization for Size (-Os)
 CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 
-# HTTP Server Buffer Settings & URI handlers for Captive Portal
-CONFIG_HTTPD_MAX_REQ_HDR_LEN=2048
-CONFIG_HTTPD_MAX_URI_LEN=512
-
-# Flash & Custom Partition Table for Large Embedded Audio Binaries
+# Flash & Custom Partition Table
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
 
-# Bluetooth Low Energy Configuration (NimBLE Stack)
+# Standalone Bluetooth Low Energy Configuration (NimBLE Stack, no Wi-Fi coexist overhead)
 CONFIG_BT_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLED=y
-CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1

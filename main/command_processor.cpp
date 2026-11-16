@@ -1,4 +1,5 @@
 
+
 #include "command_processor.h"
 #include "servo_controller.h"
 #include "ble_server.h"
@@ -30,13 +31,17 @@ void command_notify_status(void) {
 
     int s1 = 90, s2 = 90, s3 = 90;
     int o1 = 0, o2 = 0, o3 = 0;
+    bool e1 = false, e2 = false, e3 = false;
     servo_get_all_angles(&s1, &s2, &s3);
     servo_get_all_offsets(&o1, &o2, &o3);
+    servo_get_all_enabled(&e1, &e2, &e3);
 
-    char status_str[160];
+    char status_str[192];
     snprintf(status_str, sizeof(status_str),
-             "STATUS:s1=%d,s2=%d,s3=%d,o1=%d,o2=%d,o3=%d,run=%d,act=%d,loop=%d\n",
+             "STATUS:s1=%d,s2=%d,s3=%d,o1=%d,o2=%d,o3=%d,en1=%d,en2=%d,en3=%d,idle=%d,run=%d,act=%d,loop=%d\n",
              s1, s2, s3, o1, o2, o3,
+             e1 ? 1 : 0, e2 ? 1 : 0, e3 ? 1 : 0,
+             servo_get_auto_idle() ? 1 : 0,
              servo_is_sequence_running() ? 1 : 0,
              servo_get_active_slot(),
              servo_is_sequence_looping() ? 1 : 0);
@@ -120,7 +125,7 @@ void command_process(const char *cmd_line, command_print_fn_t print_fn) {
 
     // Home / Center all 3 servos to 90 degrees
     if (strcmp(p, "home") == 0 || strcmp(p, "center") == 0) {
-        servo_move_smooth(90, 90, 90, 450);
+        servo_move_smooth(90, 90, 90, 550);
         print_fn(">> Homing all servos to 90 deg...\n");
         return;
     }
@@ -129,6 +134,43 @@ void command_process(const char *cmd_line, command_print_fn_t print_fn) {
     if (strcmp(p, "stop") == 0) {
         servo_stop_motion();
         print_fn(">> Motion stopped.\n");
+        return;
+    }
+
+    // Detach / disable servo PWM (stops holding current & buzzing)
+    if (strcmp(p, "detach") == 0 || strcmp(p, "idle") == 0 || strcmp(p, "disable") == 0) {
+        servo_detach_all();
+        print_fn(">> Servos detached (idle, PWM=0).\n");
+        return;
+    }
+
+    if (strncmp(p, "detach ", 7) == 0) {
+        int idx = parse_servo_index(p + 7);
+        if (idx >= 0) {
+            servo_detach(idx);
+            char msg[48];
+            snprintf(msg, sizeof(msg), ">> Servo %d detached.\n", idx + 1);
+            print_fn(msg);
+        } else {
+            print_fn(">> Usage: detach [s1|s2|s3]\n");
+        }
+        return;
+    }
+
+    // Re-attach / enable all servos at current angles
+    if (strcmp(p, "attach") == 0 || strcmp(p, "enable") == 0) {
+        servo_attach_all();
+        print_fn(">> Servos attached (PWM enabled).\n");
+        return;
+    }
+
+    // Auto-Idle toggle: "autoidle on" / "autoidle off"
+    if (strncmp(p, "autoidle ", 9) == 0) {
+        bool en = (strcasecmp(p + 9, "on") == 0 || strcmp(p + 9, "1") == 0 || strcasecmp(p + 9, "true") == 0);
+        servo_set_auto_idle(en);
+        char msg[48];
+        snprintf(msg, sizeof(msg), "AUTO_IDLE:%d\n", en ? 1 : 0);
+        print_fn(msg);
         return;
     }
 
@@ -263,12 +305,16 @@ void command_process(const char *cmd_line, command_print_fn_t print_fn) {
     if (strcmp(p, "status") == 0) {
         int s1 = 90, s2 = 90, s3 = 90;
         int o1 = 0, o2 = 0, o3 = 0;
+        bool e1 = false, e2 = false, e3 = false;
         servo_get_all_angles(&s1, &s2, &s3);
         servo_get_all_offsets(&o1, &o2, &o3);
-        char msg[160];
+        servo_get_all_enabled(&e1, &e2, &e3);
+        char msg[192];
         snprintf(msg, sizeof(msg),
-                 "STATUS:s1=%d,s2=%d,s3=%d,o1=%d,o2=%d,o3=%d,run=%d,act=%d,loop=%d\n",
+                 "STATUS:s1=%d,s2=%d,s3=%d,o1=%d,o2=%d,o3=%d,en1=%d,en2=%d,en3=%d,idle=%d,run=%d,act=%d,loop=%d\n",
                  s1, s2, s3, o1, o2, o3,
+                 e1 ? 1 : 0, e2 ? 1 : 0, e3 ? 1 : 0,
+                 servo_get_auto_idle() ? 1 : 0,
                  servo_is_sequence_running() ? 1 : 0,
                  servo_get_active_slot(),
                  servo_is_sequence_looping() ? 1 : 0);
@@ -278,12 +324,14 @@ void command_process(const char *cmd_line, command_print_fn_t print_fn) {
 
     if (strcmp(p, "help") == 0 || strcmp(p, "?") == 0) {
         print_fn("3-Servo MP90S Arm Commands (GPIO 1, 38, 39):\n"
-                 "  s1 <0-180> / s2 <0-180> / s3 <0-180> : Move individual servo\n"
+                 "  s1 <0-180> / s2 <0-180> / s3 <0-180> : Move & enable individual servo\n"
                  "  set <s1> <s2> <s3>                   : Move all 3 immediately\n"
                  "  move <s1> <s2> <s3> [ms]             : Smooth move all 3\n"
                  "  nudge <s1|s2|s3> <+/-deg>            : Fine-step nudge\n"
                  "  home                                 : Center all to 90 deg\n"
                  "  stop                                 : Stop sequence motion\n"
+                 "  detach / attach                      : Cut or restore PWM output\n"
+                 "  autoidle <on|off>                    : Auto-detach 650ms after move\n"
                  "  offset <s1|s2|s3> <-45..45>          : Live trim offset\n"
                  "  cal_set <o1> <o2> <o3>               : Save trim to NVS Flash\n"
                  "  cal_get                              : Read trim offsets\n"
@@ -311,3 +359,4 @@ void command_on_ble_received(const char *cmd, void (*reply_fn)(const char *reply
     ESP_LOGI(TAG, "BLE Command: '%s'", cmd);
     command_process(cmd, reply_fn);
 }
+

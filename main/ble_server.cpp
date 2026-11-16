@@ -2,6 +2,7 @@
 
 #include "ble_server.h"
 #include "servo_controller.h"
+#include "command_processor.h"
 #include <string.h>
 #include <stdio.h>
 #include "esp_log.h"
@@ -37,12 +38,14 @@ static const ble_uuid128_t gatt_svr_chr_tx_uuid =
 
 static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static uint16_t s_tx_val_handle = 0;
+static uint8_t  s_own_addr_type = BLE_OWN_ADDR_PUBLIC;
 static ble_cmd_callback_t s_cmd_handler = NULL;
 
 static QueueHandle_t s_cmd_queue = NULL;
 static TimerHandle_t s_rx_flush_timer = NULL;
-static char s_rx_line_buf[BLE_CMD_MAX_LEN];
-static size_t s_rx_line_len = 0;
+static portMUX_TYPE  s_rx_mux = portMUX_INITIALIZER_UNLOCKED;
+static char          s_rx_line_buf[BLE_CMD_MAX_LEN];
+static size_t        s_rx_line_len = 0;
 
 static void ble_advertise(void);
 
@@ -52,23 +55,28 @@ static void ble_reply_fn(const char *reply) {
     }
 }
 
-static void dispatch_completed_line(void) {
-    if (s_rx_line_len == 0) return;
-    s_rx_line_buf[s_rx_line_len] = '\0';
-    if (s_cmd_queue != NULL) {
-        char msg[BLE_CMD_MAX_LEN];
-        strncpy(msg, s_rx_line_buf, sizeof(msg) - 1);
-        msg[sizeof(msg) - 1] = '\0';
+static void dispatch_completed_line_locked_copy(void) {
+    char msg[BLE_CMD_MAX_LEN];
+    size_t copy_len = 0;
+
+    portENTER_CRITICAL(&s_rx_mux);
+    if (s_rx_line_len > 0) {
+        copy_len = s_rx_line_len;
+        if (copy_len >= sizeof(msg)) copy_len = sizeof(msg) - 1;
+        memcpy(msg, s_rx_line_buf, copy_len);
+        msg[copy_len] = '\0';
+        s_rx_line_len = 0;
+    }
+    portEXIT_CRITICAL(&s_rx_mux);
+
+    if (copy_len > 0 && s_cmd_queue != NULL) {
         xQueueSend(s_cmd_queue, msg, 0);
     }
-    s_rx_line_len = 0;
 }
 
 static void rx_flush_timer_cb(TimerHandle_t xTimer) {
     (void)xTimer;
-    if (s_rx_line_len > 0) {
-        dispatch_completed_line();
-    }
+    dispatch_completed_line_locked_copy();
 }
 
 static void ble_cmd_exec_task(void *pvParameters) {
@@ -105,16 +113,22 @@ static int gatt_svr_chr_access_rx(uint16_t conn_handle, uint16_t attr_handle,
             for (uint16_t i = 0; i < read_len; i++) {
                 char ch = chunk[i];
                 if (ch == '\r' || ch == '\n') {
-                    dispatch_completed_line();
+                    dispatch_completed_line_locked_copy();
                 } else if ((uint8_t)ch >= 0x20 && (uint8_t)ch <= 0x7E) {
+                    portENTER_CRITICAL(&s_rx_mux);
                     if (s_rx_line_len < sizeof(s_rx_line_buf) - 1) {
                         s_rx_line_buf[s_rx_line_len++] = ch;
                     }
+                    portEXIT_CRITICAL(&s_rx_mux);
                 }
             }
 
-            // If packet didn't end with '\n', flush shortly unless another chunk follows
-            if (s_rx_line_len > 0 && s_rx_flush_timer != NULL) {
+            bool has_pending = false;
+            portENTER_CRITICAL(&s_rx_mux);
+            has_pending = (s_rx_line_len > 0);
+            portEXIT_CRITICAL(&s_rx_mux);
+
+            if (has_pending && s_rx_flush_timer != NULL) {
                 xTimerStart(s_rx_flush_timer, 0);
             }
         }
@@ -197,8 +211,19 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
                  event->connect.status);
         if (event->connect.status == 0) {
             s_conn_handle = event->connect.conn_handle;
+            portENTER_CRITICAL(&s_rx_mux);
             s_rx_line_len = 0;
+            portEXIT_CRITICAL(&s_rx_mux);
+
+            // Request iOS-compatible connection interval & 4s supervision timeout for battery resilience
+            struct ble_gap_upd_params conn_params = {};
+            conn_params.itvl_min = 24;              // 30 ms
+            conn_params.itvl_max = 48;              // 60 ms
+            conn_params.latency = 0;
+            conn_params.supervision_timeout = 400;  // 4.0 seconds
+            ble_gap_update_params(s_conn_handle, &conn_params);
         } else {
+            s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
             ble_advertise();
         }
         return 0;
@@ -206,12 +231,27 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
     case BLE_GAP_EVENT_DISCONNECT:
         ESP_LOGI(TAG, "BLE Disconnected (reason=%d)", event->disconnect.reason);
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+        portENTER_CRITICAL(&s_rx_mux);
         s_rx_line_len = 0;
+        portEXIT_CRITICAL(&s_rx_mux);
         ble_advertise();
         return 0;
 
+    case BLE_GAP_EVENT_SUBSCRIBE:
+        if (event->subscribe.attr_handle == s_tx_val_handle && event->subscribe.cur_notify) {
+            ESP_LOGI(TAG, "Client subscribed to TX notifications.");
+            if (s_cmd_queue != NULL) {
+                char msg[BLE_CMD_MAX_LEN];
+                snprintf(msg, sizeof(msg), "status");
+                xQueueSend(s_cmd_queue, msg, 0);
+            }
+        }
+        return 0;
+
     case BLE_GAP_EVENT_ADV_COMPLETE:
-        ble_advertise();
+        if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+            ble_advertise();
+        }
         return 0;
 
     case BLE_GAP_EVENT_MTU:
@@ -224,6 +264,10 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
 }
 
 static void ble_advertise(void) {
+    if (ble_gap_adv_active()) {
+        return;
+    }
+
     struct ble_gap_adv_params adv_params;
     struct ble_hs_adv_fields fields;
     struct ble_hs_adv_fields rsp_fields;
@@ -254,10 +298,12 @@ static void ble_advertise(void) {
     memset(&adv_params, 0, sizeof(adv_params));
     adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;
     adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
+    adv_params.itvl_min = 0x0040; // 40 ms
+    adv_params.itvl_max = 0x0080; // 80 ms
 
-    rc = ble_gap_adv_start(BLE_OWN_ADDR_PUBLIC, NULL, BLE_HS_FOREVER,
+    rc = ble_gap_adv_start(s_own_addr_type, NULL, BLE_HS_FOREVER,
                            &adv_params, ble_gap_event, NULL);
-    if (rc != 0) {
+    if (rc != 0 && rc != BLE_HS_EALREADY) {
         ESP_LOGE(TAG, "Error starting advertising: rc=%d", rc);
     } else {
         ESP_LOGI(TAG, "Advertising BLE service as '%s'...", DEVICE_NAME);
@@ -272,7 +318,19 @@ static void ble_host_task(void *param) {
 }
 
 static void ble_on_sync(void) {
-    ESP_LOGI(TAG, "NimBLE host synchronized");
+    int rc = ble_hs_util_ensure_addr(0);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_hs_util_ensure_addr failed: rc=%d", rc);
+        return;
+    }
+
+    rc = ble_hs_id_infer_auto(0, &s_own_addr_type);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_hs_id_infer_auto failed: rc=%d", rc);
+        s_own_addr_type = BLE_OWN_ADDR_PUBLIC;
+    }
+
+    ESP_LOGI(TAG, "NimBLE host synchronized (addr_type=%d)", s_own_addr_type);
     ble_advertise();
 }
 
@@ -282,7 +340,7 @@ static void ble_on_reset(int reason) {
 
 void ble_server_init(ble_cmd_callback_t cmd_handler) {
     s_cmd_handler = cmd_handler;
-    s_cmd_queue = xQueueCreate(8, BLE_CMD_MAX_LEN);
+    s_cmd_queue = xQueueCreate(12, BLE_CMD_MAX_LEN);
     s_rx_flush_timer = xTimerCreate("ble_rx_flush", pdMS_TO_TICKS(60), pdFALSE, NULL, rx_flush_timer_cb);
     xTaskCreatePinnedToCore(ble_cmd_exec_task, "ble_cmd_task", 4096, NULL, 5, NULL, 1);
 
@@ -328,10 +386,10 @@ void ble_server_send_notify(const char *message) {
     size_t len = strlen(message);
     if (len == 0) return;
 
-    // Split long payloads safely into chunks so they fit even on smaller MTUs
     const size_t CHUNK_MAX = 160;
     size_t offset = 0;
     while (offset < len) {
+        if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) break;
         size_t chunk_len = len - offset;
         if (chunk_len > CHUNK_MAX) chunk_len = CHUNK_MAX;
         struct os_mbuf *om = ble_hs_mbuf_from_flat(message + offset, chunk_len);
@@ -344,3 +402,4 @@ void ble_server_send_notify(const char *message) {
         }
     }
 }
+

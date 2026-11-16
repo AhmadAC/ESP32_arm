@@ -1,5 +1,4 @@
 
-
 const UART_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
 const UART_RX_CHAR_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
 const UART_TX_CHAR_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
@@ -204,6 +203,9 @@ function onDisconnectedCleanup() {
   document.getElementById("device-name").innerText = "None Connected";
   setUiState("Disconnected", "#f43f5e", "Connect BLE");
   appendLog("BLE", "Device disconnected.");
+  if (typeof applyReceivedEnableStates === "function") {
+    applyReceivedEnableStates(false, false, false);
+  }
   if (typeof updateActionRunBadge === "function") {
     updateActionRunBadge(false, 0, false);
   }
@@ -272,7 +274,6 @@ async function executeSendCommand(commandText) {
   const payload = commandText.endsWith("\n") ? commandText : (commandText + "\n");
 
   try {
-    // Chunk payloads > 90 chars so long action sequences work reliably across all BLE MTUs
     const CHUNK_SIZE = 90;
     for (let i = 0; i < payload.length; i += CHUNK_SIZE) {
       const piece = payload.substring(i, i + CHUNK_SIZE);
@@ -322,7 +323,8 @@ function universalBleDecode(val) {
       if (hexDecoded && (/^[\x20-\x7E\r\n\t]+$/.test(hexDecoded) ||
           hexDecoded.includes("STATUS:") || hexDecoded.includes("ANG:") ||
           hexDecoded.includes("CAL:") || hexDecoded.includes("ACT:") ||
-          hexDecoded.includes("ACT_STATE:") || hexDecoded.includes(">>"))) {
+          hexDecoded.includes("ACT_STATE:") || hexDecoded.includes("SERVO_EN:") ||
+          hexDecoded.includes("AUTO_IDLE:") || hexDecoded.includes(">>"))) {
         return hexDecoded;
       }
     }
@@ -332,7 +334,8 @@ function universalBleDecode(val) {
       if (b64Decoded && (/^[\x20-\x7E\r\n\t]+$/.test(b64Decoded) ||
           b64Decoded.includes("STATUS:") || b64Decoded.includes("ANG:") ||
           b64Decoded.includes("CAL:") || b64Decoded.includes("ACT:") ||
-          b64Decoded.includes("ACT_STATE:"))) {
+          b64Decoded.includes("ACT_STATE:") || b64Decoded.includes("SERVO_EN:") ||
+          b64Decoded.includes("AUTO_IDLE:"))) {
         return b64Decoded;
       }
     } catch (e) {}
@@ -351,13 +354,13 @@ function handleIncomingBleData(rawText, sourceTag = "BLE") {
 
   rxLineBuffer += rawText;
   const parts = rxLineBuffer.split("\n");
-  rxLineBuffer = parts.pop(); // retain incomplete trailing fragment until next notify
+  rxLineBuffer = parts.pop();
 
   parts.forEach(line => {
     const text = line.trim();
     if (!text) return;
 
-    if (!text.startsWith("ANG:") && !text.startsWith("STATUS:")) {
+    if (!text.startsWith("ANG:") && !text.startsWith("STATUS:") && !text.startsWith("SERVO_EN:")) {
       appendLog(sourceTag, text);
     }
 
@@ -365,6 +368,22 @@ function handleIncomingBleData(rawText, sourceTag = "BLE") {
       const vals = text.substring(4).split(",");
       if (vals.length >= 3 && typeof applyReceivedAngles === "function") {
         applyReceivedAngles(parseInt(vals[0], 10), parseInt(vals[1], 10), parseInt(vals[2], 10));
+      }
+      return;
+    }
+
+    if (text.startsWith("SERVO_EN:")) {
+      const vals = text.substring(9).split(",");
+      if (vals.length >= 3 && typeof applyReceivedEnableStates === "function") {
+        applyReceivedEnableStates(vals[0] === "1", vals[1] === "1", vals[2] === "1");
+      }
+      return;
+    }
+
+    if (text.startsWith("AUTO_IDLE:")) {
+      const en = text.substring(10).trim() === "1";
+      if (typeof applyAutoIdleState === "function") {
+        applyAutoIdleState(en);
       }
       return;
     }
@@ -405,6 +424,10 @@ function handleIncomingBleData(rawText, sourceTag = "BLE") {
       const mo1 = text.match(/o1=(-?\d+)/);
       const mo2 = text.match(/o2=(-?\d+)/);
       const mo3 = text.match(/o3=(-?\d+)/);
+      const me1 = text.match(/en1=(\d+)/);
+      const me2 = text.match(/en2=(\d+)/);
+      const me3 = text.match(/en3=(\d+)/);
+      const mIdle = text.match(/idle=(\d+)/);
       const mRun = text.match(/run=(\d+)/);
       const mAct = text.match(/act=(\d+)/);
       const mLoop = text.match(/loop=(\d+)/);
@@ -414,6 +437,12 @@ function handleIncomingBleData(rawText, sourceTag = "BLE") {
       }
       if (mo1 && mo2 && mo3 && typeof applyReceivedOffsets === "function") {
         applyReceivedOffsets(parseInt(mo1[1], 10), parseInt(mo2[1], 10), parseInt(mo3[1], 10));
+      }
+      if (me1 && me2 && me3 && typeof applyReceivedEnableStates === "function") {
+        applyReceivedEnableStates(me1[1] === "1", me2[1] === "1", me3[1] === "1");
+      }
+      if (mIdle && typeof applyAutoIdleState === "function") {
+        applyAutoIdleState(mIdle[1] === "1");
       }
       if (typeof updateActionRunBadge === "function") {
         updateActionRunBadge(

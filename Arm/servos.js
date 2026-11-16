@@ -2,6 +2,8 @@
 
 let servoAngles = [90, 90, 90];
 let servoOffsets = [0, 0, 0];
+let servoEnabled = [false, false, false];
+let autoIdleEnabled = false;
 let servoNames = ["Servo 1 — Base", "Servo 2 — Shoulder", "Servo 3 — Gripper"];
 let isOffsetMode = false;
 
@@ -27,6 +29,24 @@ function initServoStorage() {
     }
   } catch (e) {}
   updateAllServoUI();
+}
+
+function updateServoStateBadges() {
+  for (let i = 0; i < 3; i++) {
+    const badge = document.getElementById(`s${i + 1}-state-badge`);
+    if (!badge) continue;
+    if (servoEnabled[i]) {
+      badge.innerText = "ACTIVE";
+      badge.style.background = "rgba(16,185,129,0.2)";
+      badge.style.color = "#34d399";
+      badge.style.borderColor = "rgba(16,185,129,0.4)";
+    } else {
+      badge.innerText = "IDLE";
+      badge.style.background = "rgba(148,163,184,0.15)";
+      badge.style.color = "#94a3b8";
+      badge.style.borderColor = "rgba(148,163,184,0.3)";
+    }
+  }
 }
 
 function updateAllServoUI() {
@@ -73,6 +93,7 @@ function updateAllServoUI() {
       if (btnD) btnD.innerText = "+10°";
     }
   }
+  updateServoStateBadges();
 }
 
 function editServoName(idx) {
@@ -90,12 +111,12 @@ function toggleOffsetMode() {
   const btn = document.getElementById("offset-mode-btn");
   if (btn) {
     if (isOffsetMode) {
-      btn.innerText = "Trim Mode: ON";
+      btn.innerText = "Trim: ON";
       btn.style.background = "#f59e0b";
       btn.style.color = "#000000";
       showToast("Calibration Trim Mode Active", "warn");
     } else {
-      btn.innerText = "Trim Mode: OFF";
+      btn.innerText = "Trim: OFF";
       btn.style.background = "#1e293b";
       btn.style.color = "#f59e0b";
       showToast("Servo Angle Mode Active", "info");
@@ -104,9 +125,36 @@ function toggleOffsetMode() {
   updateAllServoUI();
 }
 
+function toggleAutoIdle() {
+  autoIdleEnabled = !autoIdleEnabled;
+  applyAutoIdleState(autoIdleEnabled);
+  sendCommand(`autoidle ${autoIdleEnabled ? "on" : "off"}`);
+  showToast(autoIdleEnabled ? "Auto-Idle ON (saves battery)" : "Auto-Idle OFF (holds torque)", "info");
+}
+
+function applyAutoIdleState(enabled) {
+  autoIdleEnabled = !!enabled;
+  const btn = document.getElementById("auto-idle-btn");
+  if (!btn) return;
+  if (autoIdleEnabled) {
+    btn.innerText = "Auto-Idle: ON";
+    btn.style.background = "#10b981";
+    btn.style.color = "#000000";
+    btn.style.borderColor = "#10b981";
+  } else {
+    btn.innerText = "Auto-Idle: OFF";
+    btn.style.background = "#1e293b";
+    btn.style.color = "rgba(255,255,255,0.75)";
+    btn.style.borderColor = "#475569";
+  }
+}
+
 function onServoSlider(idx, val) {
   const parsed = parseInt(val, 10);
   const n = idx + 1;
+
+  servoEnabled[idx] = true;
+  updateServoStateBadges();
 
   if (isOffsetMode) {
     servoOffsets[idx] = parsed;
@@ -152,6 +200,8 @@ function nudgeServo(idx, delta) {
   if (next < 0) next = 0;
   if (next > 180) next = 180;
   servoAngles[idx] = next;
+  servoEnabled[idx] = true;
+  updateServoStateBadges();
 
   const n = idx + 1;
   if (!isOffsetMode) {
@@ -169,6 +219,8 @@ function adjustOffset(idx, delta) {
   if (next < -45) next = -45;
   if (next > 45) next = 45;
   servoOffsets[idx] = next;
+  servoEnabled[idx] = true;
+  updateServoStateBadges();
 
   const n = idx + 1;
   const offEl = document.getElementById(`o${n}-val`);
@@ -211,11 +263,19 @@ async function saveCalibrationOffsets() {
 
 function homeAllServos() {
   servoAngles = [90, 90, 90];
+  servoEnabled = [true, true, true];
   try { localStorage.setItem("arm_servo_angles", JSON.stringify(servoAngles)); } catch (e) {}
   if (isOffsetMode) toggleOffsetMode();
   else updateAllServoUI();
   sendCommand("home");
   showToast("Homing all servos to 90°", "info");
+}
+
+function detachAllServos() {
+  servoEnabled = [false, false, false];
+  updateServoStateBadges();
+  sendCommand("detach");
+  showToast("Servos detached (Idle)", "warn");
 }
 
 function requestCalibrationSync() {
@@ -254,3 +314,9 @@ function applyReceivedOffsets(o1, o2, o3) {
   }
   if (isOffsetMode) updateAllServoUI();
 }
+
+function applyReceivedEnableStates(e1, e2, e3) {
+  servoEnabled = [!!e1, !!e2, !!e3];
+  updateServoStateBadges();
+}
+
