@@ -470,7 +470,8 @@ function universalBleDecode(val) {
           hexDecoded.includes("STATUS:") || hexDecoded.includes("ANG:") ||
           hexDecoded.includes("CAL:") || hexDecoded.includes("ACT:") ||
           hexDecoded.includes("ACT_STATE:") || hexDecoded.includes("SERVO_EN:") ||
-          hexDecoded.includes("AUTO_IDLE:") || hexDecoded.includes(">>"))) {
+          hexDecoded.includes("AUTO_IDLE:") || hexDecoded.includes("JINVERT:") ||
+          hexDecoded.includes(">>"))) {
         return hexDecoded;
       }
     }
@@ -481,7 +482,7 @@ function universalBleDecode(val) {
           b64Decoded.includes("STATUS:") || b64Decoded.includes("ANG:") ||
           b64Decoded.includes("CAL:") || b64Decoded.includes("ACT:") ||
           b64Decoded.includes("ACT_STATE:") || b64Decoded.includes("SERVO_EN:") ||
-          b64Decoded.includes("AUTO_IDLE:"))) {
+          b64Decoded.includes("AUTO_IDLE:") || b64Decoded.includes("JINVERT:"))) {
         return b64Decoded;
       }
     } catch (e) {}
@@ -534,6 +535,16 @@ function handleIncomingBleData(rawText, sourceTag = "BLE") {
       return;
     }
 
+    if (text.startsWith("JINVERT:")) {
+      const mx = text.match(/x=(\d+)/);
+      const my = text.match(/y=(\d+)/);
+      const en = (mx ? mx[1] === "1" : false) || (my ? my[1] === "1" : false);
+      if (typeof applyJoystickInvertState === "function") {
+        applyJoystickInvertState(en);
+      }
+      return;
+    }
+
     if (text.startsWith("CAL:")) {
       const vals = text.substring(4).split(",");
       if (vals.length >= 3 && typeof applyReceivedOffsets === "function") {
@@ -578,6 +589,8 @@ function handleIncomingBleData(rawText, sourceTag = "BLE") {
       const mAct = text.match(/act=(\d+)/);
       const mLoop = text.match(/loop=(\d+)/);
       const mBo = text.match(/bo=(\d+)/);
+      const mInvX = text.match(/invx=(\d+)/);
+      const mInvY = text.match(/invy=(\d+)/);
 
       if (mBo && mBo[1] === "1" && !brownoutNotified) {
         brownoutNotified = true;
@@ -596,6 +609,10 @@ function handleIncomingBleData(rawText, sourceTag = "BLE") {
       }
       if (mIdle && typeof applyAutoIdleState === "function") {
         applyAutoIdleState(mIdle[1] === "1");
+      }
+      if ((mInvX || mInvY) && typeof applyJoystickInvertState === "function") {
+        const invEn = (mInvX && mInvX[1] === "1") || (mInvY && mInvY[1] === "1");
+        applyJoystickInvertState(invEn);
       }
       if (typeof updateActionRunBadge === "function") {
         updateActionRunBadge(

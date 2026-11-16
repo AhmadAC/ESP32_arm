@@ -2,6 +2,7 @@ let servoAngles = [90, 90, 90];
 let servoOffsets = [0, 0, 0];
 let servoEnabled = [false, false, false];
 let autoIdleEnabled = false;
+let joyInvertEnabled = false;
 let servoNames = ["Servo 1 — Base", "Servo 2 — Shoulder", "Servo 3 — Gripper"];
 let isOffsetMode = false;
 
@@ -24,6 +25,7 @@ function initServoStorage() {
     }
   } catch (e) {}
   applyAutoIdleState(autoIdleEnabled);
+  applyJoystickInvertState(joyInvertEnabled);
   updateAllServoUI();
 }
 
@@ -141,6 +143,31 @@ function applyAutoIdleState(enabled) {
     btn.innerText = "Auto-Idle: OFF";
     btn.style.background = "#1e293b";
     btn.style.color = "rgba(255,255,255,0.75)";
+    btn.style.borderColor = "#475569";
+  }
+}
+
+function toggleJoystickInvert() {
+  joyInvertEnabled = !joyInvertEnabled;
+  applyJoystickInvertState(joyInvertEnabled);
+  sendCommand(`jinvert ${joyInvertEnabled ? "on" : "off"}`);
+  showToast(joyInvertEnabled ? "Joystick Invert ON (directions flipped)" : "Joystick Invert OFF (normal)", "info");
+}
+
+function applyJoystickInvertState(enabled) {
+  joyInvertEnabled = !!enabled;
+  const btn = document.getElementById("joy-invert-btn");
+  const txt = document.getElementById("joy-invert-text");
+  if (!btn || !txt) return;
+  if (joyInvertEnabled) {
+    txt.innerText = "Joystick Invert: ON";
+    btn.style.background = "#a855f7";
+    btn.style.color = "#ffffff";
+    btn.style.borderColor = "#c084fc";
+  } else {
+    txt.innerText = "Joystick Invert: OFF";
+    btn.style.background = "#1e293b";
+    btn.style.color = "rgba(255,255,255,0.8)";
     btn.style.borderColor = "#475569";
   }
 }
