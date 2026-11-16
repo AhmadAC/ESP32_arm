@@ -25,9 +25,15 @@ extern "C" {
 #define JOYSTICK_ADC_VRY_PIN    GPIO_NUM_3   // ADC1 Channel 2
 #define JOYSTICK_SW_PIN         GPIO_NUM_4   // Push button (Active LOW)
 
+#define JOYSTICK_MIN_SPEED_DPS      30
+#define JOYSTICK_MAX_SPEED_DPS      500
+#define JOYSTICK_DEFAULT_SPEED_DPS  260
+
 void joystick_init(void);
 void joystick_set_auto_retract(bool enabled);
 bool joystick_get_auto_retract(void);
+void joystick_set_speed(int deg_per_sec);
+int  joystick_get_speed(void);
 void joystick_close_claw(void);
 void joystick_open_claw(int target_angle);
 

@@ -121,6 +121,22 @@ void command_process(const char *cmd_line, command_print_fn_t print_fn) {
         return;
     }
 
+    // Joystick slew speed: "jspeed [30-500]"
+    if (strcmp(p, "jspeed") == 0) {
+        char msg[48];
+        snprintf(msg, sizeof(msg), "JSPEED:%d\n", joystick_get_speed());
+        print_fn(msg);
+        return;
+    }
+    if (strncmp(p, "jspeed ", 7) == 0) {
+        int spd = atoi(p + 7);
+        joystick_set_speed(spd);
+        char msg[64];
+        snprintf(msg, sizeof(msg), ">> Joystick speed set to %d deg/s\n", joystick_get_speed());
+        print_fn(msg);
+        return;
+    }
+
     // Single servo angle commands: "s1 90", "s2 45", "s3 150"
     if ((p[0] == 's' || p[0] == 'S') && (p[1] >= '1' && p[1] <= '3') && (p[2] == ' ' || p[2] == ':')) {
         int idx = p[1] - '1';
@@ -395,6 +411,7 @@ void command_process(const char *cmd_line, command_print_fn_t print_fn) {
                  "  claw <0-180|open|close>              : Direct Claw command\n"
                  "  arm <0-180> / shoulder <0-180>       : Move Arm or Shoulder\n"
                  "  autoretract <on|off>                 : Toggle Claw Auto-Retract\n"
+                 "  jspeed [30-500]                      : Get/Set Joystick speed (deg/s)\n"
                  "  s1 <deg> / s2 <deg> / s3 <deg>       : Move specific servo\n"
                  "  set <s1> <s2> <s3>                   : Move all 3 servos\n"
                  "  move <s1> <s2> <s3> [ms]             : Smooth ease all 3\n"

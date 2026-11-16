@@ -9,6 +9,7 @@
 #include "driver/gpio.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_log.h"
+#include "nvs.h"
 #include <math.h>
 #include <stdio.h>
 
@@ -23,8 +24,8 @@ static adc_oneshot_unit_handle_t adc1_handle = NULL;
 #define ADC_EFF_MAX         4000.0f
 #define ADC_MIN_SPAN        250.0f
 #define DEADZONE_NORM       0.15f
-#define EMA_ALPHA           0.35f
-#define SLEW_SPEED_DEG      1.75f          // Max degrees change per 20ms tick (~87 deg/s)
+#define EMA_ALPHA           0.45f
+#define JOYSTICK_TICK_MS    20
 #define CLAW_INDEX          0              // Servo 1 on GPIO 1
 #define ARM_INDEX           1              // Servo 2 on GPIO 38
 #define SHOULDER_INDEX      2              // Servo 3 on GPIO 39
@@ -33,6 +34,7 @@ static adc_oneshot_unit_handle_t adc1_handle = NULL;
 
 static bool s_auto_retract_enabled = true;
 static bool s_claw_was_deflected   = false;
+static volatile int s_slew_deg_per_sec = JOYSTICK_DEFAULT_SPEED_DPS;
 
 static float read_adc_avg(adc_channel_t channel, int samples) {
     long sum = 0;
@@ -71,6 +73,24 @@ void joystick_set_auto_retract(bool enabled) {
 
 bool joystick_get_auto_retract(void) {
     return s_auto_retract_enabled;
+}
+
+void joystick_set_speed(int deg_per_sec) {
+    if (deg_per_sec < JOYSTICK_MIN_SPEED_DPS) deg_per_sec = JOYSTICK_MIN_SPEED_DPS;
+    if (deg_per_sec > JOYSTICK_MAX_SPEED_DPS) deg_per_sec = JOYSTICK_MAX_SPEED_DPS;
+    s_slew_deg_per_sec = deg_per_sec;
+
+    nvs_handle_t handle;
+    if (nvs_open("arm_cfg", NVS_READWRITE, &handle) == ESP_OK) {
+        nvs_set_i32(handle, "joy_spd", (int32_t)deg_per_sec);
+        nvs_commit(handle);
+        nvs_close(handle);
+    }
+    ESP_LOGI(TAG, "Joystick slew speed set to %d deg/s", deg_per_sec);
+}
+
+int joystick_get_speed(void) {
+    return s_slew_deg_per_sec;
 }
 
 void joystick_close_claw(void) {
@@ -113,8 +133,8 @@ static void joystick_poll_task(void *pvParameters) {
     float filt_x = center_x;
     float filt_y = center_y;
 
-    ESP_LOGI(TAG, "PS2 Joystick Calibrated Center -> X: %.1f, Y: %.1f (VRX->GP38 Arm, VRY->GP39 Shoulder, SW->GP1 Claw)",
-             center_x, center_y);
+    ESP_LOGI(TAG, "PS2 Joystick Calibrated Center -> X: %.1f, Y: %.1f, Speed: %d deg/s (VRX->GP38 Arm, VRY->GP39 Shoulder, SW->GP1 Claw)",
+             center_x, center_y, s_slew_deg_per_sec);
 
     // Track active target angles as floats for sub-degree smooth slewing
     float arm_f = (float)servo_get_angle(ARM_INDEX);
@@ -126,10 +146,13 @@ static void joystick_poll_task(void *pvParameters) {
     bool sw_down = false;
     const uint8_t DEBOUNCE_TICKS = 2; // ~40ms debounce
 
+    TickType_t last_wake = xTaskGetTickCount();
     TickType_t last_notify_tick = 0;
     bool pending_status_notify = false;
 
     while (1) {
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(JOYSTICK_TICK_MS));
+
         // --- 1. Read & Filter Analog Joystick Axes ---
         float raw_x = read_adc_avg(ADC_VRX_CHANNEL, 6);
         float raw_y = read_adc_avg(ADC_VRY_CHANNEL, 6);
@@ -194,6 +217,7 @@ static void joystick_poll_task(void *pvParameters) {
                 pending_status_notify = true;
             } else {
                 // Normal mode: VRX controls Arm (GPIO 38) and VRY controls Shoulder (GPIO 39)
+                float slew_per_tick = ((float)s_slew_deg_per_sec * (float)JOYSTICK_TICK_MS) / 1000.0f;
                 float eff_x = 0.0f;
                 float eff_y = 0.0f;
 
@@ -208,7 +232,7 @@ static void joystick_poll_task(void *pvParameters) {
 
                 // Slew Arm (Servo 2 / GPIO 38)
                 if (fabsf(eff_x) > 0.01f) {
-                    arm_f += eff_x * SLEW_SPEED_DEG;
+                    arm_f += eff_x * slew_per_tick;
                     if (arm_f < (float)SERVO_MIN_ANGLE) arm_f = (float)SERVO_MIN_ANGLE;
                     if (arm_f > (float)SERVO_MAX_ANGLE) arm_f = (float)SERVO_MAX_ANGLE;
                     servo_set_angle(ARM_INDEX, (int)lroundf(arm_f));
@@ -217,7 +241,7 @@ static void joystick_poll_task(void *pvParameters) {
 
                 // Slew Shoulder (Servo 3 / GPIO 39)
                 if (fabsf(eff_y) > 0.01f) {
-                    shoulder_f += eff_y * SLEW_SPEED_DEG;
+                    shoulder_f += eff_y * slew_per_tick;
                     if (shoulder_f < (float)SERVO_MIN_ANGLE) shoulder_f = (float)SERVO_MIN_ANGLE;
                     if (shoulder_f > (float)SERVO_MAX_ANGLE) shoulder_f = (float)SERVO_MAX_ANGLE;
                     servo_set_angle(SHOULDER_INDEX, (int)lroundf(shoulder_f));
@@ -246,12 +270,21 @@ static void joystick_poll_task(void *pvParameters) {
             last_notify_tick = xTaskGetTickCount();
             pending_status_notify = false;
         }
-
-        vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
 
 void joystick_init(void) {
+    nvs_handle_t handle;
+    if (nvs_open("arm_cfg", NVS_READONLY, &handle) == ESP_OK) {
+        int32_t spd = JOYSTICK_DEFAULT_SPEED_DPS;
+        if (nvs_get_i32(handle, "joy_spd", &spd) == ESP_OK) {
+            if (spd < JOYSTICK_MIN_SPEED_DPS) spd = JOYSTICK_MIN_SPEED_DPS;
+            if (spd > JOYSTICK_MAX_SPEED_DPS) spd = JOYSTICK_MAX_SPEED_DPS;
+            s_slew_deg_per_sec = (int)spd;
+        }
+        nvs_close(handle);
+    }
+
     // 1. Configure ADC1 for VRX (GPIO 2) and VRY (GPIO 3)
     adc_oneshot_unit_init_cfg_t init_config1 = {
         .unit_id = ADC_UNIT_1,
@@ -283,5 +316,6 @@ void joystick_init(void) {
     // 3. Launch background polling task
     xTaskCreatePinnedToCore(joystick_poll_task, "joystick_task", 4096, NULL, 4, NULL, 1);
 
-    ESP_LOGI(TAG, "PS2 Joystick Initialized: VRX=GPIO2 (Arm), VRY=GPIO3 (Shoulder), SW=GPIO4 (Claw Auto-Close)");
+    ESP_LOGI(TAG, "PS2 Joystick Initialized: VRX=GPIO2 (Arm), VRY=GPIO3 (Shoulder), SW=GPIO4 (Claw Auto-Close), Speed=%d deg/s",
+             s_slew_deg_per_sec);
 }

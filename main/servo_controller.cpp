@@ -19,7 +19,7 @@ static const char *TAG = "SERVO_ARM";
 #define LEDC_DUTY_RES       LEDC_TIMER_14_BIT
 #define LEDC_FREQUENCY      50
 #define MOTION_TICK_MS      20
-#define SERVO_MAX_STEP_DEG  2.0f   // Max 2 deg per 20ms tick (100 deg/sec) to prevent overshoot & battery spikes
+#define SERVO_MAX_STEP_DEG  10.0f  // Max 10 deg per 20ms tick (500 deg/sec) for fast response without 1-tick spikes
 #define AUTO_IDLE_DELAY_MS  3000   // Relax PWM 3.0s after motion finishes when Auto-Idle is ON
 #define NVS_SAVE_DELAY_MS   2500   // Persist settled angles 2.5s after motion finishes
 
