@@ -1,0 +1,256 @@
+
+
+let servoAngles = [90, 90, 90];
+let servoOffsets = [0, 0, 0];
+let servoNames = ["Servo 1 — Base", "Servo 2 — Shoulder", "Servo 3 — Gripper"];
+let isOffsetMode = false;
+
+let pendingServoCmds = {};
+let servoThrottleTimer = null;
+
+function initServoStorage() {
+  try {
+    const storedNames = localStorage.getItem("arm_servo_names");
+    if (storedNames) {
+      const parsed = JSON.parse(storedNames);
+      if (Array.isArray(parsed) && parsed.length === 3) servoNames = parsed;
+    }
+    const storedOffsets = localStorage.getItem("arm_servo_offsets");
+    if (storedOffsets) {
+      const parsed = JSON.parse(storedOffsets);
+      if (Array.isArray(parsed) && parsed.length === 3) servoOffsets = parsed;
+    }
+    const storedAngles = localStorage.getItem("arm_servo_angles");
+    if (storedAngles) {
+      const parsed = JSON.parse(storedAngles);
+      if (Array.isArray(parsed) && parsed.length === 3) servoAngles = parsed;
+    }
+  } catch (e) {}
+  updateAllServoUI();
+}
+
+function updateAllServoUI() {
+  for (let i = 0; i < 3; i++) {
+    const n = i + 1;
+    const offEl = document.getElementById(`o${n}-val`);
+    if (offEl) offEl.innerText = `${servoOffsets[i] > 0 ? "+" : ""}${servoOffsets[i]}°`;
+
+    const sl = document.getElementById(`s${n}-slider`);
+    const hdr = document.getElementById(`s${n}-header`);
+
+    const btnA = document.getElementById(`s${n}-btn-a`);
+    const btnB = document.getElementById(`s${n}-btn-b`);
+    const btnC = document.getElementById(`s${n}-btn-c`);
+    const btnD = document.getElementById(`s${n}-btn-d`);
+
+    if (isOffsetMode) {
+      if (sl) {
+        sl.classList.add("offset-slider");
+        sl.min = "-45";
+        sl.max = "45";
+        sl.value = servoOffsets[i];
+      }
+      if (hdr) {
+        hdr.innerHTML = `${escapeHtml(servoNames[i])} Trim: <span id="s${n}-val" style="color:#f59e0b; font-family:monospace; font-weight:700;">${servoOffsets[i] > 0 ? "+" : ""}${servoOffsets[i]}°</span>`;
+      }
+      if (btnA) btnA.innerText = "-1 Trim";
+      if (btnB) btnB.innerText = "+1 Trim";
+      if (btnC) btnC.innerText = "-5°";
+      if (btnD) btnD.innerText = "+5°";
+    } else {
+      if (sl) {
+        sl.classList.remove("offset-slider");
+        sl.min = "0";
+        sl.max = "180";
+        sl.value = servoAngles[i];
+      }
+      if (hdr) {
+        hdr.innerHTML = `${escapeHtml(servoNames[i])}: <span id="s${n}-val" style="color:#38bdf8; font-family:monospace; font-weight:700;">${servoAngles[i]}°</span>`;
+      }
+      if (btnA) btnA.innerText = "-10°";
+      if (btnB) btnB.innerText = "-1°";
+      if (btnC) btnC.innerText = "+1°";
+      if (btnD) btnD.innerText = "+10°";
+    }
+  }
+}
+
+function editServoName(idx) {
+  const current = servoNames[idx] || `Servo ${idx + 1}`;
+  const next = prompt(`Rename Servo ${idx + 1}:`, current);
+  if (next && next.trim().length > 0) {
+    servoNames[idx] = next.trim().substring(0, 28);
+    try { localStorage.setItem("arm_servo_names", JSON.stringify(servoNames)); } catch (e) {}
+    updateAllServoUI();
+  }
+}
+
+function toggleOffsetMode() {
+  isOffsetMode = !isOffsetMode;
+  const btn = document.getElementById("offset-mode-btn");
+  if (btn) {
+    if (isOffsetMode) {
+      btn.innerText = "Trim Mode: ON";
+      btn.style.background = "#f59e0b";
+      btn.style.color = "#000000";
+      showToast("Calibration Trim Mode Active", "warn");
+    } else {
+      btn.innerText = "Trim Mode: OFF";
+      btn.style.background = "#1e293b";
+      btn.style.color = "#f59e0b";
+      showToast("Servo Angle Mode Active", "info");
+    }
+  }
+  updateAllServoUI();
+}
+
+function onServoSlider(idx, val) {
+  const parsed = parseInt(val, 10);
+  const n = idx + 1;
+
+  if (isOffsetMode) {
+    servoOffsets[idx] = parsed;
+    const offEl = document.getElementById(`o${n}-val`);
+    if (offEl) offEl.innerText = `${parsed > 0 ? "+" : ""}${parsed}°`;
+    const valEl = document.getElementById(`s${n}-val`);
+    if (valEl) valEl.innerText = `${parsed > 0 ? "+" : ""}${parsed}°`;
+    pendingServoCmds[`o${n}`] = `offset s${n} ${parsed}`;
+    try { localStorage.setItem("arm_servo_offsets", JSON.stringify(servoOffsets)); } catch (e) {}
+  } else {
+    servoAngles[idx] = parsed;
+    const valEl = document.getElementById(`s${n}-val`);
+    if (valEl) valEl.innerText = `${parsed}°`;
+    pendingServoCmds[`s${n}`] = `s${n} ${parsed}`;
+    try { localStorage.setItem("arm_servo_angles", JSON.stringify(servoAngles)); } catch (e) {}
+  }
+
+  if (!servoThrottleTimer) {
+    servoThrottleTimer = setTimeout(() => {
+      servoThrottleTimer = null;
+      for (const k in pendingServoCmds) {
+        sendCommand(pendingServoCmds[k]);
+      }
+      pendingServoCmds = {};
+    }, 40);
+  }
+}
+
+function servoStepAction(idx, normalDelta, trimDelta) {
+  if (isOffsetMode) {
+    if (trimDelta === -1 || trimDelta === 1) {
+      adjustOffset(idx, trimDelta);
+    } else {
+      nudgeServo(idx, trimDelta);
+    }
+  } else {
+    nudgeServo(idx, normalDelta);
+  }
+}
+
+function nudgeServo(idx, delta) {
+  let next = (servoAngles[idx] || 90) + delta;
+  if (next < 0) next = 0;
+  if (next > 180) next = 180;
+  servoAngles[idx] = next;
+
+  const n = idx + 1;
+  if (!isOffsetMode) {
+    const sl = document.getElementById(`s${n}-slider`);
+    if (sl) sl.value = next;
+    const valEl = document.getElementById(`s${n}-val`);
+    if (valEl) valEl.innerText = `${next}°`;
+  }
+  sendCommand(`s${n} ${next}`);
+  try { localStorage.setItem("arm_servo_angles", JSON.stringify(servoAngles)); } catch (e) {}
+}
+
+function adjustOffset(idx, delta) {
+  let next = (servoOffsets[idx] || 0) + delta;
+  if (next < -45) next = -45;
+  if (next > 45) next = 45;
+  servoOffsets[idx] = next;
+
+  const n = idx + 1;
+  const offEl = document.getElementById(`o${n}-val`);
+  if (offEl) offEl.innerText = `${next > 0 ? "+" : ""}${next}°`;
+  if (isOffsetMode) {
+    const sl = document.getElementById(`s${n}-slider`);
+    if (sl) sl.value = next;
+    const valEl = document.getElementById(`s${n}-val`);
+    if (valEl) valEl.innerText = `${next > 0 ? "+" : ""}${next}°`;
+  }
+  sendCommand(`offset s${n} ${next}`);
+  appendLog("Trim", `S${n} Offset -> ${next}°`);
+  try { localStorage.setItem("arm_servo_offsets", JSON.stringify(servoOffsets)); } catch (e) {}
+}
+
+async function saveCalibrationOffsets() {
+  const btn = document.getElementById("save-cal-btn");
+  const txt = document.getElementById("save-cal-text");
+  if (txt) txt.innerText = "Saving...";
+  if (btn) btn.style.background = "#0284c7";
+
+  try {
+    localStorage.setItem("arm_servo_offsets", JSON.stringify(servoOffsets));
+  } catch (e) {}
+
+  await sendCommand(`cal_set ${servoOffsets[0]} ${servoOffsets[1]} ${servoOffsets[2]}`);
+  if (isOffsetMode) toggleOffsetMode();
+  else updateAllServoUI();
+
+  appendLog("Calibration", `Saved Trim Offsets to NVS: S1=${servoOffsets[0]}, S2=${servoOffsets[1]}, S3=${servoOffsets[2]}`);
+  showToast("Trim offsets saved to ESP32 Flash!", "success");
+
+  if (txt) txt.innerText = "Saved to Flash";
+  if (btn) btn.style.background = "#059669";
+  setTimeout(() => {
+    if (txt) txt.innerText = "Save Trim to Flash";
+    if (btn) btn.style.background = "#10b981";
+  }, 1500);
+}
+
+function homeAllServos() {
+  servoAngles = [90, 90, 90];
+  try { localStorage.setItem("arm_servo_angles", JSON.stringify(servoAngles)); } catch (e) {}
+  if (isOffsetMode) toggleOffsetMode();
+  else updateAllServoUI();
+  sendCommand("home");
+  showToast("Homing all servos to 90°", "info");
+}
+
+function requestCalibrationSync() {
+  sendCommand("cal_get");
+  showToast("Fetching trim offsets...", "info");
+}
+
+function requestStatusSync() {
+  sendCommand("status");
+  showToast("Syncing arm state...", "info");
+}
+
+function applyReceivedAngles(s1, s2, s3) {
+  const incoming = [s1, s2, s3];
+  for (let i = 0; i < 3; i++) {
+    if (isNaN(incoming[i])) continue;
+    servoAngles[i] = incoming[i];
+    const n = i + 1;
+    if (!isOffsetMode && document.activeElement !== document.getElementById(`s${n}-slider`)) {
+      const sl = document.getElementById(`s${n}-slider`);
+      if (sl) sl.value = incoming[i];
+      const lbl = document.getElementById(`s${n}-val`);
+      if (lbl) lbl.innerText = `${incoming[i]}°`;
+    }
+  }
+}
+
+function applyReceivedOffsets(o1, o2, o3) {
+  const incoming = [o1, o2, o3];
+  for (let i = 0; i < 3; i++) {
+    if (isNaN(incoming[i])) continue;
+    servoOffsets[i] = incoming[i];
+    const n = i + 1;
+    const offEl = document.getElementById(`o${n}-val`);
+    if (offEl) offEl.innerText = `${incoming[i] > 0 ? "+" : ""}${incoming[i]}°`;
+  }
+  if (isOffsetMode) updateAllServoUI();
+}
