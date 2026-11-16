@@ -34,7 +34,9 @@ static adc_oneshot_unit_handle_t adc1_handle = NULL;
 
 static bool s_auto_retract_enabled = true;
 static bool s_claw_was_deflected   = false;
-static volatile int s_slew_deg_per_sec = JOYSTICK_DEFAULT_SPEED_DPS;
+static volatile int  s_slew_deg_per_sec = JOYSTICK_DEFAULT_SPEED_DPS;
+static volatile bool s_invert_x         = false;
+static volatile bool s_invert_y         = false;
 
 static float read_adc_avg(adc_channel_t channel, int samples) {
     long sum = 0;
@@ -93,6 +95,25 @@ int joystick_get_speed(void) {
     return s_slew_deg_per_sec;
 }
 
+void joystick_set_invert(bool x_inv, bool y_inv) {
+    s_invert_x = x_inv;
+    s_invert_y = y_inv;
+
+    nvs_handle_t handle;
+    if (nvs_open("arm_cfg", NVS_READWRITE, &handle) == ESP_OK) {
+        nvs_set_i32(handle, "joy_invx", x_inv ? 1 : 0);
+        nvs_set_i32(handle, "joy_invy", y_inv ? 1 : 0);
+        nvs_commit(handle);
+        nvs_close(handle);
+    }
+    ESP_LOGI(TAG, "Joystick invert updated -> X:%s, Y:%s", x_inv ? "ON" : "OFF", y_inv ? "ON" : "OFF");
+}
+
+void joystick_get_invert(bool *x_inv, bool *y_inv) {
+    if (x_inv) *x_inv = s_invert_x;
+    if (y_inv) *y_inv = s_invert_y;
+}
+
 void joystick_close_claw(void) {
     servo_set_angle(CLAW_INDEX, CLAW_CLOSED_ANGLE);
     s_claw_was_deflected = false;
@@ -133,8 +154,8 @@ static void joystick_poll_task(void *pvParameters) {
     float filt_x = center_x;
     float filt_y = center_y;
 
-    ESP_LOGI(TAG, "PS2 Joystick Calibrated Center -> X: %.1f, Y: %.1f, Speed: %d deg/s (VRX->GP38 Arm, VRY->GP39 Shoulder, SW->GP1 Claw)",
-             center_x, center_y, s_slew_deg_per_sec);
+    ESP_LOGI(TAG, "PS2 Joystick Calibrated Center -> X: %.1f, Y: %.1f, Speed: %d deg/s, Invert(X:%d,Y:%d)",
+             center_x, center_y, s_slew_deg_per_sec, s_invert_x ? 1 : 0, s_invert_y ? 1 : 0);
 
     // Track active target angles as floats for sub-degree smooth slewing
     float arm_f = (float)servo_get_angle(ARM_INDEX);
@@ -162,6 +183,9 @@ static void joystick_poll_task(void *pvParameters) {
 
         float nx = normalize_axis(filt_x, center_x);
         float ny = normalize_axis(filt_y, center_y);
+
+        if (s_invert_x) nx = -nx;
+        if (s_invert_y) ny = -ny;
 
         float mag = sqrtf((nx * nx) + (ny * ny));
         if (mag > 1.0f) mag = 1.0f;
@@ -282,6 +306,13 @@ void joystick_init(void) {
             if (spd > JOYSTICK_MAX_SPEED_DPS) spd = JOYSTICK_MAX_SPEED_DPS;
             s_slew_deg_per_sec = (int)spd;
         }
+        int32_t inv = 0;
+        if (nvs_get_i32(handle, "joy_invx", &inv) == ESP_OK) {
+            s_invert_x = (inv != 0);
+        }
+        if (nvs_get_i32(handle, "joy_invy", &inv) == ESP_OK) {
+            s_invert_y = (inv != 0);
+        }
         nvs_close(handle);
     }
 
@@ -316,6 +347,6 @@ void joystick_init(void) {
     // 3. Launch background polling task
     xTaskCreatePinnedToCore(joystick_poll_task, "joystick_task", 4096, NULL, 4, NULL, 1);
 
-    ESP_LOGI(TAG, "PS2 Joystick Initialized: VRX=GPIO2 (Arm), VRY=GPIO3 (Shoulder), SW=GPIO4 (Claw Auto-Close), Speed=%d deg/s",
-             s_slew_deg_per_sec);
+    ESP_LOGI(TAG, "PS2 Joystick Initialized: VRX=GPIO2 (Arm), VRY=GPIO3 (Shoulder), SW=GPIO4 (Claw Auto-Close), Speed=%d deg/s, Invert(X:%d,Y:%d)",
+             s_slew_deg_per_sec, s_invert_x ? 1 : 0, s_invert_y ? 1 : 0);
 }

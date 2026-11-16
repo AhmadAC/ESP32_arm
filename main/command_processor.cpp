@@ -22,6 +22,11 @@ static int parse_servo_index(const char *token) {
     return -1;
 }
 
+static bool parse_bool_arg(const char *s) {
+    if (!s) return false;
+    return (strcasecmp(s, "on") == 0 || strcmp(s, "1") == 0 || strcasecmp(s, "true") == 0);
+}
+
 void command_set_auto_retract(bool en) {
     s_auto_retract = en;
 }
@@ -40,14 +45,16 @@ void command_notify_status(void) {
     int s1 = 90, s2 = 90, s3 = 90;
     int o1 = 0, o2 = 0, o3 = 0;
     bool e1 = false, e2 = false, e3 = false;
+    bool inv_x = false, inv_y = false;
     servo_get_all_angles(&s1, &s2, &s3);
     servo_get_all_offsets(&o1, &o2, &o3);
     servo_get_all_enabled(&e1, &e2, &e3);
+    joystick_get_invert(&inv_x, &inv_y);
     int brownout = (esp_reset_reason() == ESP_RST_BROWNOUT) ? 1 : 0;
 
-    char status_str[220];
+    char status_str[256];
     snprintf(status_str, sizeof(status_str),
-             "STATUS:s1=%d,s2=%d,s3=%d,o1=%d,o2=%d,o3=%d,en1=%d,en2=%d,en3=%d,idle=%d,run=%d,act=%d,loop=%d,bo=%d,ar=%d\n",
+             "STATUS:s1=%d,s2=%d,s3=%d,o1=%d,o2=%d,o3=%d,en1=%d,en2=%d,en3=%d,idle=%d,run=%d,act=%d,loop=%d,bo=%d,ar=%d,invx=%d,invy=%d\n",
              s1, s2, s3, o1, o2, o3,
              e1 ? 1 : 0, e2 ? 1 : 0, e3 ? 1 : 0,
              servo_get_auto_idle() ? 1 : 0,
@@ -55,7 +62,9 @@ void command_notify_status(void) {
              servo_get_active_slot(),
              servo_is_sequence_looping() ? 1 : 0,
              brownout,
-             s_auto_retract ? 1 : 0);
+             s_auto_retract ? 1 : 0,
+             inv_x ? 1 : 0,
+             inv_y ? 1 : 0);
     ble_server_send_notify(status_str);
 }
 
@@ -113,7 +122,7 @@ void command_process(const char *cmd_line, command_print_fn_t print_fn) {
 
     // Auto-Retract toggle: "autoretract <on|off>"
     if (strncmp(p, "autoretract ", 12) == 0) {
-        bool en = (strcasecmp(p + 12, "on") == 0 || strcmp(p + 12, "1") == 0 || strcasecmp(p + 12, "true") == 0);
+        bool en = parse_bool_arg(p + 12);
         joystick_set_auto_retract(en);
         char msg[48];
         snprintf(msg, sizeof(msg), "AUTORETRACT:%d\n", en ? 1 : 0);
@@ -134,6 +143,49 @@ void command_process(const char *cmd_line, command_print_fn_t print_fn) {
         char msg[64];
         snprintf(msg, sizeof(msg), ">> Joystick speed set to %d deg/s\n", joystick_get_speed());
         print_fn(msg);
+        return;
+    }
+
+    // Joystick invert toggle: "jinvert [on|off]" or "jinvert <x|y> <on|off>"
+    if (strcmp(p, "jinvert") == 0) {
+        bool inv_x = false, inv_y = false;
+        joystick_get_invert(&inv_x, &inv_y);
+        char msg[48];
+        snprintf(msg, sizeof(msg), "JINVERT:x=%d,y=%d\n", inv_x ? 1 : 0, inv_y ? 1 : 0);
+        print_fn(msg);
+        return;
+    }
+    if (strncmp(p, "jinvert ", 8) == 0) {
+        char tok1[16] = {0};
+        char tok2[16] = {0};
+        int n = sscanf(p + 8, "%15s %15s", tok1, tok2);
+        bool inv_x = false, inv_y = false;
+        joystick_get_invert(&inv_x, &inv_y);
+
+        if (n == 1) {
+            bool en = parse_bool_arg(tok1);
+            inv_x = en;
+            inv_y = en;
+        } else if (n == 2) {
+            bool en = parse_bool_arg(tok2);
+            if (strcasecmp(tok1, "x") == 0 || strcasecmp(tok1, "arm") == 0) {
+                inv_x = en;
+            } else if (strcasecmp(tok1, "y") == 0 || strcasecmp(tok1, "shoulder") == 0) {
+                inv_y = en;
+            } else {
+                print_fn(">> Usage: jinvert <on|off> or jinvert <x|y> <on|off>\n");
+                return;
+            }
+        } else {
+            print_fn(">> Usage: jinvert <on|off> or jinvert <x|y> <on|off>\n");
+            return;
+        }
+
+        joystick_set_invert(inv_x, inv_y);
+        char msg[48];
+        snprintf(msg, sizeof(msg), "JINVERT:x=%d,y=%d\n", inv_x ? 1 : 0, inv_y ? 1 : 0);
+        print_fn(msg);
+        command_notify_status();
         return;
     }
 
@@ -247,7 +299,7 @@ void command_process(const char *cmd_line, command_print_fn_t print_fn) {
 
     // Auto-Idle toggle: "autoidle on" / "autoidle off"
     if (strncmp(p, "autoidle ", 9) == 0) {
-        bool en = (strcasecmp(p + 9, "on") == 0 || strcmp(p + 9, "1") == 0 || strcasecmp(p + 9, "true") == 0);
+        bool en = parse_bool_arg(p + 9);
         servo_set_auto_idle(en);
         char msg[48];
         snprintf(msg, sizeof(msg), "AUTO_IDLE:%d\n", en ? 1 : 0);
@@ -387,13 +439,15 @@ void command_process(const char *cmd_line, command_print_fn_t print_fn) {
         int s1 = 90, s2 = 90, s3 = 90;
         int o1 = 0, o2 = 0, o3 = 0;
         bool e1 = false, e2 = false, e3 = false;
+        bool inv_x = false, inv_y = false;
         servo_get_all_angles(&s1, &s2, &s3);
         servo_get_all_offsets(&o1, &o2, &o3);
         servo_get_all_enabled(&e1, &e2, &e3);
+        joystick_get_invert(&inv_x, &inv_y);
         int brownout = (esp_reset_reason() == ESP_RST_BROWNOUT) ? 1 : 0;
-        char msg[220];
+        char msg[256];
         snprintf(msg, sizeof(msg),
-                 "STATUS:s1=%d,s2=%d,s3=%d,o1=%d,o2=%d,o3=%d,en1=%d,en2=%d,en3=%d,idle=%d,run=%d,act=%d,loop=%d,bo=%d,ar=%d\n",
+                 "STATUS:s1=%d,s2=%d,s3=%d,o1=%d,o2=%d,o3=%d,en1=%d,en2=%d,en3=%d,idle=%d,run=%d,act=%d,loop=%d,bo=%d,ar=%d,invx=%d,invy=%d\n",
                  s1, s2, s3, o1, o2, o3,
                  e1 ? 1 : 0, e2 ? 1 : 0, e3 ? 1 : 0,
                  servo_get_auto_idle() ? 1 : 0,
@@ -401,7 +455,9 @@ void command_process(const char *cmd_line, command_print_fn_t print_fn) {
                  servo_get_active_slot(),
                  servo_is_sequence_looping() ? 1 : 0,
                  brownout,
-                 s_auto_retract ? 1 : 0);
+                 s_auto_retract ? 1 : 0,
+                 inv_x ? 1 : 0,
+                 inv_y ? 1 : 0);
         print_fn(msg);
         return;
     }
@@ -412,6 +468,7 @@ void command_process(const char *cmd_line, command_print_fn_t print_fn) {
                  "  arm <0-180> / shoulder <0-180>       : Move Arm or Shoulder\n"
                  "  autoretract <on|off>                 : Toggle Claw Auto-Retract\n"
                  "  jspeed [30-500]                      : Get/Set Joystick speed (deg/s)\n"
+                 "  jinvert [on|off] / [x|y] <on|off>    : Invert Joystick directions\n"
                  "  s1 <deg> / s2 <deg> / s3 <deg>       : Move specific servo\n"
                  "  set <s1> <s2> <s3>                   : Move all 3 servos\n"
                  "  move <s1> <s2> <s3> [ms]             : Smooth ease all 3\n"

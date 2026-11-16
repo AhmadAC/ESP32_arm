@@ -34,6 +34,8 @@ void joystick_set_auto_retract(bool enabled);
 bool joystick_get_auto_retract(void);
 void joystick_set_speed(int deg_per_sec);
 int  joystick_get_speed(void);
+void joystick_set_invert(bool x_inv, bool y_inv);
+void joystick_get_invert(bool *x_inv, bool *y_inv);
 void joystick_close_claw(void);
 void joystick_open_claw(int target_angle);
 
